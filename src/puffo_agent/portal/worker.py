@@ -462,6 +462,33 @@ def _handle_suppressed_reply(
     return True, backoff
 
 
+def _check_startup_auth_or_pause(
+    adapter: "Adapter", runtime: "RuntimeState", agent_id: str,
+) -> bool:
+    """PUF-207: return True on True/None (proceed); on False,
+    auto-pause the agent with a recoverable runtime.error and
+    return False."""
+    if adapter.auth_healthy is not False:
+        return True
+    runtime.status = "paused"
+    runtime.health = "auth_failed"
+    runtime.error = (
+        f"Agent {agent_id}: Claude Code OAuth is missing or expired. "
+        "Paused on startup so this agent does not spawn into a "
+        "known-broken state.\n"
+        "To recover:\n"
+        "  1. Open a separate Terminal (not from within an agent's "
+        "own shell), then run `claude` and `/login` to authenticate.\n"
+        f"  2. From the same machine, resume agent {agent_id} with "
+        f"`puffo-agent agent resume {agent_id}`\n"
+        "     (a venv install may need the full path to "
+        "`puffo-agent`)."
+    )
+    runtime.save(agent_id)
+    return False
+
+
+
 class Worker:
     """Runs a single AI agent inside the daemon event loop."""
 
@@ -620,6 +647,22 @@ class Worker:
             self.runtime.error = str(e)
             self.runtime.save(agent_id)
             # Init crashed before warm() — release the startup gate.
+            self._warm_done.set()
+            return
+
+        # PUF-207: pause on auth_healthy=False so we don't spawn into
+        # a known-broken state (FB-159).
+        try:
+            await self._adapter.refresh_ping()
+        except Exception as exc:
+            logger.warning(
+                "agent %s: startup auth probe failed "
+                "(will retry on refresh tick): %s",
+                agent_id, exc,
+            )
+        if not _check_startup_auth_or_pause(
+            self._adapter, self.runtime, agent_id,
+        ):
             self._warm_done.set()
             return
 
