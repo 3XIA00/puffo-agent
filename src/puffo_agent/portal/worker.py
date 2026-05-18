@@ -43,10 +43,34 @@ logger = logging.getLogger(__name__)
 
 RECONNECT_BACKOFF_SECONDS = 5.0
 
-# Poll rate for the adapter's OAuth refresh check. The adapter
-# decides per-tick whether to actually probe based on credentials
-# mtime; this is just the upper bound on staleness.
 CREDENTIAL_REFRESH_TICK_SECONDS = 10 * 60
+CREDENTIAL_REFRESH_TICK_FLOOR_SECONDS = 60
+
+
+def _next_refresh_tick(
+    expires_in_seconds: int | None,
+    *,
+    default_tick: int = CREDENTIAL_REFRESH_TICK_SECONDS,
+    threshold: int | None = None,
+    floor: int = CREDENTIAL_REFRESH_TICK_FLOOR_SECONDS,
+) -> int:
+    """PUF-213: adaptive refresh sleep — bounded retry inside the
+    refresh window, wakes ``threshold`` seconds before expiry
+    otherwise; ``None`` TTL falls back to ``default_tick``."""
+    if threshold is None:
+        # Lazy import keeps this helper unit-testable.
+        from ..agent.adapters.base import (
+            CREDENTIAL_REFRESH_BEFORE_EXPIRY_SECONDS as _DEFAULT_THRESHOLD,
+        )
+        threshold = _DEFAULT_THRESHOLD
+    if expires_in_seconds is None:
+        return default_tick
+    target = expires_in_seconds - threshold
+    if target < floor:
+        return floor
+    if target > default_tick:
+        return default_tick
+    return target
 
 
 def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
@@ -901,7 +925,14 @@ class Worker:
         async def credential_refresh():
             """Periodically refresh OAuth credentials before they
             expire. The adapter's mtime check skips the work when
-            another consumer just refreshed the shared file."""
+            another consumer just refreshed the shared file.
+
+            PUF-213: the sleep duration is adaptive — when the
+            access token is close to expiry we tick more often, so
+            the refresh window never falls entirely inside one
+            sleep interval. Far from expiry we fall back to the
+            default 10-minute heartbeat.
+            """
             # Skip the first tick to avoid piling onto warm().
             try:
                 await asyncio.wait_for(
@@ -928,10 +959,17 @@ class Worker:
                 elif probed is False:
                     self.runtime.health = "auth_failed"
                 self.runtime.save(agent_id)
+                # Scale next sleep to current TTL so we never miss
+                # the refresh window.
+                try:
+                    expires_in = self._adapter._credentials_expires_in_seconds()
+                except Exception:
+                    expires_in = None
+                next_tick = _next_refresh_tick(expires_in)
                 try:
                     await asyncio.wait_for(
                         self._stop.wait(),
-                        timeout=CREDENTIAL_REFRESH_TICK_SECONDS,
+                        timeout=next_tick,
                     )
                 except asyncio.TimeoutError:
                     pass
