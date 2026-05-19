@@ -17,6 +17,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Callable, Optional
 
 from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError, PuffoAgent
@@ -42,35 +43,6 @@ from .state import (
 logger = logging.getLogger(__name__)
 
 RECONNECT_BACKOFF_SECONDS = 5.0
-
-CREDENTIAL_REFRESH_TICK_SECONDS = 10 * 60
-CREDENTIAL_REFRESH_TICK_FLOOR_SECONDS = 60
-
-
-def _next_refresh_tick(
-    expires_in_seconds: int | None,
-    *,
-    default_tick: int = CREDENTIAL_REFRESH_TICK_SECONDS,
-    threshold: int | None = None,
-    floor: int = CREDENTIAL_REFRESH_TICK_FLOOR_SECONDS,
-) -> int:
-    """PUF-213: adaptive refresh sleep — bounded retry inside the
-    refresh window, wakes ``threshold`` seconds before expiry
-    otherwise; ``None`` TTL falls back to ``default_tick``."""
-    if threshold is None:
-        # Lazy import keeps this helper unit-testable.
-        from ..agent.adapters.base import (
-            CREDENTIAL_REFRESH_BEFORE_EXPIRY_SECONDS as _DEFAULT_THRESHOLD,
-        )
-        threshold = _DEFAULT_THRESHOLD
-    if expires_in_seconds is None:
-        return default_tick
-    target = expires_in_seconds - threshold
-    if target < floor:
-        return floor
-    if target > default_tick:
-        return default_tick
-    return target
 
 
 def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
@@ -433,6 +405,7 @@ def _handle_suppressed_reply(
     agent_id: str,
     *,
     scope: str,
+    on_auth_failure: Optional[Callable[[], None]] = None,
 ) -> tuple[bool, float]:
     """Shared landing for a suppressed worker-error leak. Returns
     ``(suppressed, backoff_seconds)``:
@@ -446,7 +419,10 @@ def _handle_suppressed_reply(
     ``runtime.error`` with a scope-tagged + leak-class-tagged
     message, and (if auth-class) flip ``runtime.health="auth_failed"``
     — that signal is definitive regardless of which scope surfaced
-    it."""
+    it. ``on_auth_failure`` fires on the auth-class branch only;
+    PUF-221 hooks the daemon's ``CredentialRefresher.notify_refresh_needed``
+    here so a 401-leak short-circuits the 2-min poll instead of
+    waiting for the next tick."""
     safe_reply = _suppress_worker_error_leak(reply)
     if safe_reply is not None:
         return False, 0.0
@@ -461,6 +437,14 @@ def _handle_suppressed_reply(
     )
     if is_auth:
         runtime.health = "auth_failed"
+        if on_auth_failure is not None:
+            try:
+                on_auth_failure()
+            except Exception as exc:
+                logger.warning(
+                    "agent %s: on_auth_failure callback raised: %s",
+                    agent_id, exc,
+                )
     if scope == "api-error-retry":
         if is_auth:
             runtime.error = (
@@ -486,39 +470,24 @@ def _handle_suppressed_reply(
     return True, backoff
 
 
-def _check_startup_auth_or_pause(
-    adapter: "Adapter", runtime: "RuntimeState", agent_id: str,
-) -> bool:
-    """PUF-207: return True on True/None (proceed); on False,
-    auto-pause the agent with a recoverable runtime.error and
-    return False."""
-    if adapter.auth_healthy is not False:
-        return True
-    runtime.status = "paused"
-    runtime.health = "auth_failed"
-    runtime.error = (
-        f"Agent {agent_id}: Claude Code OAuth is missing or expired. "
-        "Paused on startup so this agent does not spawn into a "
-        "known-broken state.\n"
-        "To recover:\n"
-        "  1. Open a separate Terminal (not from within an agent's "
-        "own shell), then run `claude` and `/login` to authenticate.\n"
-        f"  2. From the same machine, resume agent {agent_id} with "
-        f"`puffo-agent agent resume {agent_id}`\n"
-        "     (a venv install may need the full path to "
-        "`puffo-agent`)."
-    )
-    runtime.save(agent_id)
-    return False
-
-
 
 class Worker:
     """Runs a single AI agent inside the daemon event loop."""
 
-    def __init__(self, daemon_cfg: DaemonConfig, agent_cfg: AgentConfig):
+    def __init__(
+        self,
+        daemon_cfg: DaemonConfig,
+        agent_cfg: AgentConfig,
+        *,
+        notify_refresh_needed: Optional[Callable[[], None]] = None,
+    ):
         self.daemon_cfg = daemon_cfg
         self.agent_cfg = agent_cfg
+        # PUF-221: daemon-owned CredentialRefresher hook. Fired from
+        # the auth-class leak branch in _handle_suppressed_reply so a
+        # 401 surfacing in a reply short-circuits the daemon's 2-min
+        # poll instead of waiting for the next tick.
+        self._notify_refresh_needed = notify_refresh_needed
         self.runtime = RuntimeState(
             status="running",
             started_at=int(time.time()),
@@ -674,21 +643,11 @@ class Worker:
             self._warm_done.set()
             return
 
-        # PUF-207: pause on auth_healthy=False so we don't spawn into
-        # a known-broken state (FB-159).
-        try:
-            await self._adapter.refresh_ping()
-        except Exception as exc:
-            logger.warning(
-                "agent %s: startup auth probe failed "
-                "(will retry on refresh tick): %s",
-                agent_id, exc,
-            )
-        if not _check_startup_auth_or_pause(
-            self._adapter, self.runtime, agent_id,
-        ):
-            self._warm_done.set()
-            return
+        # PUF-221: per-agent refresh_ping retired — daemon-level
+        # CredentialRefresher (portal/credential_refresh.py) owns
+        # OAuth refresh + writes back to ``~/.claude/.credentials.json``
+        # as a single writer. Agents just read the disk file via the
+        # per-agent symlink the daemon refresher maintains.
 
         # Warm the adapter so persisted-session agents re-spawn their
         # subprocess now rather than on the first DM. Non-fatal.
@@ -861,6 +820,7 @@ class Worker:
                     self.runtime,
                     agent_id,
                     scope="fallback",
+                    on_auth_failure=self._notify_refresh_needed,
                 )
                 if suppressed:
                     await asyncio.sleep(backoff)
@@ -902,6 +862,7 @@ class Worker:
                     self.runtime,
                     agent_id,
                     scope="api-error-retry",
+                    on_auth_failure=self._notify_refresh_needed,
                 )
                 if suppressed:
                     # Hottest leak site (FB-88 / FB-159 case-studies).
@@ -922,57 +883,10 @@ class Worker:
                 except asyncio.TimeoutError:
                     pass
 
-        async def credential_refresh():
-            """Periodically refresh OAuth credentials before they
-            expire. The adapter's mtime check skips the work when
-            another consumer just refreshed the shared file.
-
-            PUF-213: the sleep duration is adaptive — when the
-            access token is close to expiry we tick more often, so
-            the refresh window never falls entirely inside one
-            sleep interval. Far from expiry we fall back to the
-            default 10-minute heartbeat.
-            """
-            # Skip the first tick to avoid piling onto warm().
-            try:
-                await asyncio.wait_for(
-                    self._stop.wait(),
-                    timeout=CREDENTIAL_REFRESH_TICK_SECONDS,
-                )
-                return
-            except asyncio.TimeoutError:
-                pass
-            while not self._stop.is_set():
-                try:
-                    await self._adapter.refresh_ping()
-                except Exception as exc:
-                    logger.warning(
-                        "agent %s: credential refresh tick failed: %s",
-                        agent_id, exc,
-                    )
-                # Reflect the probe result into runtime.health so
-                # ``puffoagent status`` shows auth_failed without log
-                # tailing. None pre-first-probe stays "unknown".
-                probed = getattr(self._adapter, "auth_healthy", None)
-                if probed is True:
-                    self.runtime.health = "ok"
-                elif probed is False:
-                    self.runtime.health = "auth_failed"
-                self.runtime.save(agent_id)
-                # Scale next sleep to current TTL so we never miss
-                # the refresh window.
-                try:
-                    expires_in = self._adapter._credentials_expires_in_seconds()
-                except Exception:
-                    expires_in = None
-                next_tick = _next_refresh_tick(expires_in)
-                try:
-                    await asyncio.wait_for(
-                        self._stop.wait(),
-                        timeout=next_tick,
-                    )
-                except asyncio.TimeoutError:
-                    pass
+        # PUF-221: per-agent credential_refresh coroutine retired —
+        # CredentialRefresher in portal/credential_refresh.py owns the
+        # refresh loop daemon-wide. Single writer = no multi-process
+        # rotation race on Anthropic's single-use refresh tokens.
 
         # Server-side status reporter: own heartbeat task; begin_turn /
         # end_turn fire inline from on_message via this closure. Falls
@@ -995,7 +909,6 @@ class Worker:
             reporter = _NoopReporter()  # type: ignore[assignment]
 
         hb_task = asyncio.ensure_future(heartbeat())
-        refresh_task = asyncio.ensure_future(credential_refresh())
         status_task = asyncio.ensure_future(reporter.run_heartbeat_loop())
         try:
             while not self._stop.is_set():
@@ -1028,9 +941,8 @@ class Worker:
         finally:
             reporter.stop()
             hb_task.cancel()
-            refresh_task.cancel()
             status_task.cancel()
-            for task in (hb_task, refresh_task, status_task):
+            for task in (hb_task, status_task):
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
