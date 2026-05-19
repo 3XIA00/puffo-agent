@@ -302,30 +302,18 @@ async def test_send_message_threaded_false_not_coerced():
 
 
 @pytest.mark.asyncio
-async def test_send_message_discovers_channel_in_other_space():
-    """When the channel id isn't in the local cache (no inbound seen
-    yet), send_message walks ``/spaces`` + ``/spaces/<sp>/channels``
-    for a definitive match — and aims the members call at the
-    *discovered* space, not at ``cfg.space_id``. Fixes FB-76: the
-    previous silent fallback to ``cfg.space_id`` produced wrong-space
-    members requests that surfaced as ``'str' object has no attribute
-    'get'`` three layers up."""
-    cfg, http, _ = _setup()
+async def test_send_message_uses_cached_space_for_cross_space_channel():
+    """send_message resolves channel→space from the local cache —
+    which is filled by membership events as they arrive over the WS
+    (see ``puffo_core_client._handle_event``). A channel that lives
+    in a non-home space must still get its members call routed to
+    the correct space, with no ``cfg.space_id`` fallback in sight.
+    """
+    cfg, http, ms = _setup()
     recipient_kem = KemKeyPair.generate()
-    # cfg.space_id is "sp_test"; the channel actually lives in a
-    # DIFFERENT space the agent has access to.
-    http.responses["/spaces"] = {
-        "spaces": [
-            {"space_id": "sp_test", "name": "Home"},
-            {"space_id": "sp_other", "name": "Other Team"},
-        ],
-    }
-    http.responses["/spaces/sp_test/channels"] = {
-        "channels": [{"channel_id": "ch_home", "name": "general"}],
-    }
-    http.responses["/spaces/sp_other/channels"] = {
-        "channels": [{"channel_id": "ch_elsewhere", "name": "general"}],
-    }
+    # Pre-cache the mapping the way an ``accept_channel_invite`` /
+    # ``invite_to_channel`` / ``create_channel`` event would.
+    await ms.mark_channel_space("ch_elsewhere", "sp_other")
     http.responses["/spaces/sp_other/channels/ch_elsewhere/members"] = {
         "members": [{"slug": "alice-0001", "role": "member"}],
     }
@@ -349,9 +337,6 @@ async def test_send_message_discovers_channel_in_other_space():
         },
     )
     assert "posted" in result, f"expected success, got: {result}"
-    # Critical: the members call must target sp_other (correct), NOT
-    # sp_test (the previous wrong-space fallback) — that's the
-    # regression we're guarding against.
     members_paths = [
         path for method, path, _ in http.calls
         if method == "GET" and "ch_elsewhere/members" in path
@@ -362,20 +347,23 @@ async def test_send_message_discovers_channel_in_other_space():
     assert not any("/spaces/sp_test/" in p for p in members_paths), (
         f"must NOT hit sp_test (wrong-space fallback regression): {members_paths}"
     )
+    # And critically: no /spaces walking — the cache should be the
+    # only authority. (Pre-cache fix removed the FB-76-era resolver
+    # that walked /spaces + /spaces/<sp>/channels.)
+    assert not any(
+        path == "/spaces" for method, path, _ in http.calls
+        if method == "GET"
+    ), "no /spaces walk should occur — cache lookup is the only path"
 
 
 @pytest.mark.asyncio
-async def test_send_message_fails_loud_when_channel_not_in_any_space():
-    """When neither the local cache nor any accessible space contains
-    the channel, send_message raises a clear unresolved-channel error
-    instead of silently sending to the wrong space — FB-76 fix."""
+async def test_send_message_fails_loud_on_cache_miss():
+    """A channel the agent has no cached mapping for produces a
+    clear MCP error — no walking ``/spaces`` as a guess, no falling
+    back to ``cfg.space_id``. The agent's source of truth for
+    channel→space is the event stream; if no event fed the cache,
+    the agent isn't a member and shouldn't be sending."""
     cfg, http, _ = _setup()
-    http.responses["/spaces"] = {
-        "spaces": [{"space_id": "sp_test", "name": "Home"}],
-    }
-    http.responses["/spaces/sp_test/channels"] = {
-        "channels": [{"channel_id": "ch_known", "name": "general"}],
-    }
     mcp = _build_tools(cfg)
     with pytest.raises(Exception) as excinfo:
         await _call(
@@ -386,15 +374,32 @@ async def test_send_message_fails_loud_when_channel_not_in_any_space():
                 "is_visible_to_human": True,
             },
         )
-    assert "can't resolve which space" in str(excinfo.value), (
-        f"expected an unresolved-channel error, got: {excinfo.value}"
+    assert "no record of channel" in str(excinfo.value), (
+        f"expected a cache-miss error, got: {excinfo.value}"
     )
-    # And critically: no wrong-space members call was issued.
+    # No members call, no /spaces walk — the resolver bailed before
+    # any HTTP.
     assert not any(
-        "ch_nowhere/members" in path
+        "ch_nowhere/members" in path or path == "/spaces"
         for method, path, _ in http.calls
         if method == "GET"
-    ), "must not issue a members call when space resolution fails"
+    ), f"must not issue HTTP on cache miss; calls={http.calls}"
+
+
+@pytest.mark.asyncio
+async def test_list_channel_members_fails_loud_on_cache_miss():
+    """list_channel_members reads the cache too — miss = clear error,
+    no fallback to ``cfg.space_id``."""
+    cfg, http, _ = _setup()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "list_channel_members", {"channel": "ch_unknown"})
+    assert "no record of channel" in str(excinfo.value)
+    assert not any(
+        "ch_unknown/members" in path
+        for method, path, _ in http.calls
+        if method == "GET"
+    ), "must not issue a members call when cache misses"
 
 
 @pytest.mark.asyncio
@@ -555,94 +560,184 @@ async def test_get_thread_history_empty_window():
 
 
 @pytest.mark.asyncio
-async def test_list_channels():
-    """Channels come from ``/spaces/<sp>/events`` replay — there's no
-    standalone channels endpoint on puffo-server."""
+async def test_list_spaces_returns_server_filtered_memberships():
+    """``GET /spaces`` is server-filtered to memberships the agent
+    actually has; the tool just formats the result. Server-side
+    enforcement means "if it's in the list, the agent can write
+    there" — pair with ``list_channels_in_space`` for the channel
+    detail."""
     cfg, http, ms = _setup()
-    http.responses["/spaces/sp_test/events"] = {
-        "events": [
-            {"kind": "create_space", "payload": {"space_id": "sp_test", "name": "Test"}},
-            {"kind": "create_channel", "payload": {"channel_id": "ch_1", "name": "General"}},
-            {"kind": "create_channel", "payload": {"channel_id": "ch_2", "name": "Random"}},
-            {"kind": "invite_to_space", "payload": {"invitee_slug": "alice-0001"}},
+    http.responses["/spaces"] = {
+        "spaces": [
+            {"space_id": "sp_team", "name": "Team"},
+            {"space_id": "sp_other", "name": "Other"},
         ],
-        "has_more": False,
     }
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_channels")
-    assert "General" in result
-    assert "Random" in result
-    assert "ch_1" in result
-    assert "ch_2" in result
+    result = await _call(mcp, "list_spaces")
+    assert "sp_team" in result and "Team" in result
+    assert "sp_other" in result and "Other" in result
+    # No per-space round-trips — list_spaces stays cheap.
+    per_space_calls = [c for c in http.calls if "/channels" in c[1]]
+    assert per_space_calls == []
 
 
 @pytest.mark.asyncio
-async def test_list_channels_paginates_via_since():
-    """``list_channels`` walks ``/spaces/<sp>/events`` page-by-page
-    using ``?since=<next_cursor>``. Guards against a regression of
-    the ``?cursor=`` bug — the server's axum extractor silently
-    ignored the wrong-named key, so paginated calls re-fetched the
-    first page forever and the tool never returned."""
+async def test_list_spaces_returns_empty_marker_when_not_a_member():
     cfg, http, ms = _setup()
-    # Page 1: one channel + cursor pointing at page 2.
-    http.responses["/spaces/sp_test/events"] = {
-        "events": [
-            {"kind": "create_channel", "payload": {"channel_id": "ch_1", "name": "General"}},
-        ],
-        "has_more": True,
-        "next_cursor": "cursor_page2",
-    }
-    # Page 2: second channel + end of stream. Registered against the
-    # exact ``?since=`` URL so a regression to ``?cursor=`` would miss
-    # this entry and fall back to page 1 (loop forever).
-    http.responses["/spaces/sp_test/events?since=cursor_page2"] = {
-        "events": [
-            {"kind": "create_channel", "payload": {"channel_id": "ch_2", "name": "Random"}},
-        ],
-        "has_more": False,
-    }
+    http.responses["/spaces"] = {"spaces": []}
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_channels")
-
-    assert "General" in result
-    assert "ch_1" in result
-    assert "Random" in result
-    assert "ch_2" in result
-
-    events_calls = [c for c in http.calls if c[1].startswith("/spaces/sp_test/events")]
-    # Exactly two requests: page 1 (no query) + page 2 (?since=).
-    assert len(events_calls) == 2, events_calls
-    assert events_calls[0][1] == "/spaces/sp_test/events"
-    assert "?since=cursor_page2" in events_calls[1][1]
+    result = await _call(mcp, "list_spaces")
+    assert "not a member" in result
 
 
 @pytest.mark.asyncio
-async def test_list_channels_bails_on_stuck_cursor():
-    """If the server ever regresses and returns the same cursor it
-    was just sent, the tool must stop instead of spinning. Mirrors
-    the strict-advance guard in ``fetchChannelsFromEvents``
-    (web) and ``_resolve_channel_name`` (this package)."""
+async def test_list_channels_in_space_scopes_to_one_space():
+    """``list_channels_in_space(space_id)`` round-trips exactly one
+    ``GET /spaces/<sp>/channels`` and formats the result. No
+    ``GET /spaces`` enumeration; no ``cfg.space_id`` consulting."""
     cfg, http, ms = _setup()
-    # Both the initial and the ``?since=stuck`` request hand back
-    # the same ``next_cursor`` — a real regression would loop, the
-    # guarded loop bails after the second fetch.
-    page = {
-        "events": [
-            {"kind": "create_channel", "payload": {"channel_id": "ch_1", "name": "General"}},
+    cfg.space_id = "sp_legacy"  # must be irrelevant
+    http.responses["/spaces/sp_target/channels"] = {
+        "channels": [
+            {"channel_id": "ch_g", "name": "general"},
+            {"channel_id": "ch_r", "name": "random"},
         ],
-        "has_more": True,
-        "next_cursor": "stuck",
     }
-    http.responses["/spaces/sp_test/events"] = page
-    http.responses["/spaces/sp_test/events?since=stuck"] = page
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_channels")
+    result = await _call(mcp, "list_channels_in_space", {"space_id": "sp_target"})
 
-    assert "General" in result
-    events_calls = [c for c in http.calls if c[1].startswith("/spaces/sp_test/events")]
-    # Two calls: initial, then one with ``?since=stuck`` whose
-    # ``next_cursor`` is also ``stuck`` — the guard breaks the loop.
-    assert len(events_calls) == 2, events_calls
+    assert "ch_g" in result and "general" in result
+    assert "ch_r" in result and "random" in result
+    # Exactly one round-trip; never to cfg.space_id or /spaces.
+    assert ("GET", "/spaces/sp_target/channels", None) in http.calls
+    assert not any(c[1] == "/spaces" for c in http.calls)
+    assert not any("sp_legacy" in c[1] for c in http.calls)
+
+
+@pytest.mark.asyncio
+async def test_list_channels_in_space_requires_space_id():
+    """Missing ``space_id`` is a contract error — surface it as an
+    MCP tool error rather than silently using ``cfg.space_id``."""
+    cfg, http, ms = _setup()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception):
+        await _call(mcp, "list_channels_in_space", {"space_id": ""})
+
+
+@pytest.mark.asyncio
+async def test_list_channels_in_space_tolerates_string_response():
+    """Tight race after AcceptSpaceInvite: server briefly returns
+    the SPA HTML stub (``str``). Treat as "no channels yet"."""
+    cfg, http, ms = _setup()
+    http.responses["/spaces/sp_racy/channels"] = ""
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_channels_in_space", {"space_id": "sp_racy"})
+    assert "no channels" in result
+
+
+@pytest.mark.asyncio
+async def test_list_channels_in_all_spaces_enumerates_all_spaces():
+    """One ``GET /spaces`` + one ``GET /spaces/<sp>/channels`` per
+    space, grouped output. Convenience shortcut over ``list_spaces``
+    + per-space calls."""
+    cfg, http, ms = _setup()
+    http.responses["/spaces"] = {
+        "spaces": [
+            {"space_id": "sp_team", "name": "Team"},
+            {"space_id": "sp_other", "name": "Other"},
+        ],
+    }
+    http.responses["/spaces/sp_team/channels"] = {
+        "channels": [
+            {"channel_id": "ch_g_team", "name": "General", "is_public": True},
+            {"channel_id": "ch_rand", "name": "Random", "is_public": False},
+        ],
+    }
+    http.responses["/spaces/sp_other/channels"] = {
+        "channels": [
+            {"channel_id": "ch_g_other", "name": "General", "is_public": True},
+        ],
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_channels_in_all_spaces")
+
+    # Both spaces named, grouped, with all their channels.
+    assert "sp_team" in result and "Team" in result
+    assert "sp_other" in result and "Other" in result
+    assert "ch_g_team" in result and "ch_rand" in result
+    assert "ch_g_other" in result
+    # One /spaces + one /spaces/<sp>/channels per space.
+    assert ("GET", "/spaces", None) in http.calls
+    assert ("GET", "/spaces/sp_team/channels", None) in http.calls
+    assert ("GET", "/spaces/sp_other/channels", None) in http.calls
+
+
+@pytest.mark.asyncio
+async def test_list_channels_in_all_spaces_returns_empty_message_with_no_spaces():
+    """Agent not in any space (new install, fully cascaded out) —
+    no /spaces/<sp>/channels round-trips at all."""
+    cfg, http, ms = _setup()
+    http.responses["/spaces"] = {"spaces": []}
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_channels_in_all_spaces")
+
+    assert "not a member" in result
+    per_space_calls = [c for c in http.calls if "/channels" in c[1]]
+    assert per_space_calls == []
+
+
+@pytest.mark.asyncio
+async def test_list_channels_in_all_spaces_ignores_cfg_space_id():
+    """Req 3 anchor: ``cfg.space_id`` is legacy metadata and must
+    not gate the LLM's view. An agent with ``cfg.space_id``
+    pointing at a space it IS NOT in must still see channels in the
+    spaces it IS in."""
+    cfg, http, ms = _setup()
+    cfg.space_id = "sp_legacy_not_a_member"  # explicit miss
+    http.responses["/spaces"] = {
+        "spaces": [{"space_id": "sp_real", "name": "Real"}],
+    }
+    http.responses["/spaces/sp_real/channels"] = {
+        "channels": [
+            {"channel_id": "ch_only", "name": "general"},
+        ],
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_channels_in_all_spaces")
+
+    assert "ch_only" in result
+    assert "sp_real" in result
+    legacy_calls = [
+        c for c in http.calls
+        if "sp_legacy_not_a_member" in c[1]
+    ]
+    assert legacy_calls == [], (
+        f"expected no calls into cfg.space_id, got {legacy_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_channels_in_all_spaces_tolerates_per_space_string_response():
+    """One space's ``/channels`` returns the SPA HTML stub (tight
+    race); other spaces still enumerate cleanly."""
+    cfg, http, ms = _setup()
+    http.responses["/spaces"] = {
+        "spaces": [
+            {"space_id": "sp_a", "name": "A"},
+            {"space_id": "sp_b", "name": "B"},
+        ],
+    }
+    http.responses["/spaces/sp_a/channels"] = ""  # racy / unhealthy
+    http.responses["/spaces/sp_b/channels"] = {
+        "channels": [{"channel_id": "ch_x", "name": "general"}],
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_channels_in_all_spaces")
+
+    assert "sp_a" in result
+    assert "(no channels)" in result
+    assert "ch_x" in result
 
 
 @pytest.mark.asyncio
@@ -1100,13 +1195,15 @@ async def test_send_message_with_attachments_auto_corrects_reply_as_root_id(
 
 
 @pytest.mark.asyncio
-async def test_all_9_tools_registered():
+async def test_core_tools_registered():
     cfg, _, _ = _setup()
     mcp = _build_tools(cfg)
     tool_names = {t.name for t in await mcp.list_tools()}
     expected = {
         "whoami", "send_message", "get_channel_history",
-        "list_channels", "list_channel_members", "get_user_info",
-        "get_post", "send_message_with_attachments", "fetch_channel_files",
+        "list_spaces", "list_channels_in_all_spaces",
+        "list_channels_in_space", "list_channel_members",
+        "get_user_info", "get_post", "send_message_with_attachments",
+        "fetch_channel_files",
     }
     assert expected.issubset(tool_names)
