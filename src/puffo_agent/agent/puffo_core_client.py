@@ -463,10 +463,12 @@ class PuffoCoreMessageClient:
         # under the same TTL — transient lookup failures self-heal at
         # the next tick instead of pinning a permanent "" miss.
         self._profile_cache: dict[str, tuple[str, str, float]] = {}
-        # Invitation event_ids the worker has already processed; per-
-        # listen() (cleared on reconnect). Server-side state is the
-        # durable record — this cache just avoids repeating work
-        # within a session.
+        # Invitation event_ids the worker has already processed.
+        # Lifetime-scoped — the operator-DM branch isn't idempotent
+        # against server-side state, so resetting on reconnect would
+        # re-emit the operator-confirm prompt for every still-pending
+        # invite. Lost on daemon restart (acceptable: re-DM rate is
+        # naturally rare).
         self._processed_invite_ids: set[str] = set()
         # When the worker DMs the operator about a non-auto-acceptable
         # invite, the DM's envelope_id lives here so a ``y``/``n``
@@ -826,9 +828,6 @@ class PuffoCoreMessageClient:
         self._queue = asyncio.PriorityQueue()
         self._queue_seq = 0
         self._thread_state: dict[str, _ThreadEntry] = {}
-        # Reset on every (re)connect — the auto-accept path is
-        # idempotent against server-side state.
-        self._processed_invite_ids = set()
         consumer_task = asyncio.ensure_future(
             self._consume_queue(on_message, on_api_error_retry),
         )
