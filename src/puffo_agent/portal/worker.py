@@ -927,6 +927,45 @@ class Worker:
                         channel_id, reply, root_id=root_id,
                     )
 
+        async def on_api_error_abandon(
+            root_id: str,
+            batch: list[dict],
+            channel_meta: dict,
+            attempts: int,
+        ):
+            """PUF-252: surface the abandoned-batch state on
+            ``runtime`` so the discoverable-action affordance has a
+            signal to render. Pre-PUF-252 the abandon was silent and
+            Sam's Scout appeared ``state=running`` even though the
+            consumer had given up on the pending DM. Now
+            ``runtime.health`` flips to ``api_error_abandoned`` +
+            ``runtime.error`` carries a human-readable summary.
+
+            UI consumers live in Nova's lane: **FB-197**
+            (agent-state status dot) + **FB-198** (restart lever),
+            both folded into the Operator Action Panel cluster
+            alongside FB-67 / PUF-220 / PUF-248 / PUF-250 / FB-179.
+            Deliberately NO auto-recovery here -- per the
+            ``feedback_dedup_triage_policy.md`` revision at PUF-249
+            closure, platform doesn't substitute for user-action
+            when user-action exists. Auto-recovery is storage-
+            shaped-defense-with-time-delay; same rejection criterion
+            as throttling. FB-198's restart lever is the right
+            recovery surface; this hook just feeds it honest data.
+            """
+            self.runtime.health = "api_error_abandoned"
+            self.runtime.error = (
+                f"Worker abandoned a batch on thread {root_id} after "
+                f"{attempts} rate-limit kick-retries. The agent has "
+                "gone silent on this thread until it is refreshed/"
+                "restarted."
+            )
+            self.runtime.save(agent_id)
+            logger.warning(
+                "agent %s: api-error-abandon on thread %s (attempts=%d)",
+                agent_id, root_id, attempts,
+            )
+
         async def heartbeat():
             interval = max(1.0, self.daemon_cfg.runtime_heartbeat_seconds)
             while not self._stop.is_set():
@@ -969,6 +1008,7 @@ class Worker:
                     await client.listen(
                         on_message=on_message_batch,
                         on_api_error_retry=on_api_error_retry,
+                        on_api_error_abandon=on_api_error_abandon,
                     )
                 except asyncio.CancelledError:
                     raise
