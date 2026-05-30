@@ -56,7 +56,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 from .state import link_host_codex_auth, link_host_credentials
 
@@ -628,6 +628,7 @@ class CredentialRefresher:
             self.host_credentials = backend.host_credentials
         self._refresh_request = asyncio.Event()
         self._agent_homes: set[Path] = set()
+        self._on_refresh_success: list[Callable[[], None]] = []
         self._lock = asyncio.Lock()
 
     def register_agent(self, agent_home: Path) -> None:
@@ -635,6 +636,25 @@ class CredentialRefresher:
 
     def unregister_agent(self, agent_home: Path) -> None:
         self._agent_homes.discard(Path(agent_home))
+
+    def register_on_refresh_success(self, callback: Callable[[], None]) -> None:
+        self._on_refresh_success.append(callback)
+
+    def unregister_on_refresh_success(self, callback: Callable[[], None]) -> None:
+        try:
+            self._on_refresh_success.remove(callback)
+        except ValueError:
+            pass
+
+    def _fire_refresh_success(self) -> None:
+        # list(...) defensive copy: callback may (un)register during dispatch.
+        for cb in list(self._on_refresh_success):
+            try:
+                cb()
+            except Exception as exc:
+                logger.warning(
+                    "credential refresh-success callback raised: %s", exc,
+                )
 
     def notify_refresh_needed(self) -> None:
         """In-process trigger from an agent that just saw a 401."""
@@ -721,6 +741,7 @@ class CredentialRefresher:
                 continue
             if rotated:
                 self._sync_views()
+                self._fire_refresh_success()
 
     async def _sleep_until_next_tick(self, stop_event: asyncio.Event) -> None:
         stop_task = asyncio.create_task(stop_event.wait())
@@ -755,10 +776,11 @@ class CredentialRefresher:
     async def _refresh_now(
         self, *, expires_in: int | None, by_agent: bool,
     ) -> None:
-        """Single-writer refresh through the backend. The
-        ``asyncio.Lock`` is what makes the rotating-RT race
-        unwinnable: a second caller can't see an in-flight rotation
-        mid-write."""
+        """Single-writer refresh through the backend; the lock makes
+        the rotating-RT race unwinnable."""
+        # Fire only on REFRESHED: UNCHANGED / FAILED leave the on-disk
+        # token unchanged, so clearing auth_failed would oscillate.
+        outcome: RefreshOutcome | None = None
         async with self._lock:
             before = self.expires_in_seconds()
             if (
@@ -776,9 +798,12 @@ class CredentialRefresher:
                 expires_in, by_agent,
             )
             try:
-                await self.backend.refresh()
+                outcome = await self.backend.refresh()
             except Exception as exc:
                 logger.warning("backend refresh errored: %s", exc)
+                outcome = RefreshOutcome.FAILED
+        if outcome is RefreshOutcome.REFRESHED:
+            self._fire_refresh_success()
 
     def _sync_views(self) -> None:
         """Mirror canonical credentials to every registered agent."""
