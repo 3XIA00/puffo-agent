@@ -77,6 +77,59 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   + raw API error. No ``api_error_abandoned`` flip — request-too-large
   is a permanent input-side failure class, not a transient.
 
+- **PUF-265: ``CredentialRefresher`` no longer silently runs on a dead
+  refresh mechanism.** ``_refresh_now`` used to call
+  ``await self.backend.refresh()`` without capturing the returned
+  ``RefreshOutcome``, so the "claude exited 0 but expiresAt didn't
+  advance" case (UNCHANGED) fell through unnoticed. The daemon went
+  back to its 2-minute poll loop, ``runtime.health`` stayed
+  ``"unknown"`` fleet-wide, and operators only noticed once individual
+  agents 401'd hours later.
+
+  ``_refresh_now`` now captures the outcome (exception → ``FAILED``)
+  and feeds ``_propagate_outcome``, which tracks a consecutive
+  non-success streak. After ``REFRESH_BROKEN_THRESHOLD = 2`` ticks
+  (~4 min @ 120s poll), every registered agent's ``runtime.health``
+  flips to ``"refresh_broken"`` with an operator-actionable error
+  (``"Run `claude /login` then `puffo-agent agent resume <id>`"``).
+  Cleared unconditionally on the next REFRESHED tick — daemon
+  restarts can still unstick agents stuck on the previous instance's
+  flipped state. Does not overwrite ``"auth_failed"`` /
+  ``"api_error_abandoned"`` (stronger downstream signals; same
+  operator recovery). ``agent list`` surfaces ``[refresh_broken]``.
+
+  ``FileBackend``'s UNCHANGED branch dumps stdout + stderr tails
+  (400 chars each) at ERROR level for forensic discrimination of the
+  underlying root cause.
+
+  v2 hardening (post-2026-05-29 09:08 UTC Anthropic-side rate-limit
+  incident): the refresh probe is now pinned to ``claude-haiku-4-5``
+  via ``--model`` (Haiku has higher per-model limits than the
+  operator's interactive Opus/Sonnet default, so the probe stops
+  fighting model-specific rate windows). A new
+  ``RefreshOutcome.RATE_LIMITED`` variant is returned when the
+  probe's stderr/stdout matches a canonical Anthropic rate-limit
+  signature (six anchored patterns: 429 / "temporarily limiting
+  requests" / ``rate_limit_error`` / 5h-quota / 529 overloaded).
+  RATE_LIMITED counts toward the refresh_broken streak (same as
+  FAILED — the rotation really didn't happen) AND schedules a
+  randomised ``[5, 15]`` s fast retry via ``_refresh_request.set()``
+  instead of parking on the natural 120s poll. Back-to-back
+  rate-limit hits coalesce into one pending retry task.
+
+  Model deprecation defence: a hardcoded ``REFRESH_PROBE_MODEL``
+  would silently break the day Anthropic retires Haiku 4.5. A
+  ``_probe_model_disabled`` module-level latch detects four
+  ``model_not_found`` surfaces in the probe stderr/stdout
+  (``"type":"not_found_error"`` + ``model`` / ``model not found`` /
+  ``model_not_found`` / ``invalid model`` / ``model X does not exist
+  | is not available | unknown``) and on first hit drops ``--model``
+  from subsequent probes, letting claude pick its current default.
+  The first tick after a deprecation counts as FAILED (streak=1),
+  the next tick succeeds with the default and resets — no spurious
+  ``refresh_broken`` flip. Operator can also override the constant
+  via ``PUFFO_AGENT_REFRESH_MODEL`` env var without a release.
+
 - **Codex agent archive/delete failing with ``Permission denied`` on
   ``.codex/tmp/.../.lock`` (Windows).** The codex CLI holds an
   exclusive file lock on ``.codex/tmp/arg0/codex-<id>/.lock`` for the
