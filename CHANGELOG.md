@@ -8,6 +8,46 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **PUF-263: ``/v1/agents/export`` enforces paused-only.** A running
+  agent may be mid-write (memory updates, ``cli_session.json``
+  refresh, in-flight skill state) so a snapshot would be inconsistent
+  and could either silently lose data or restore into a broken state
+  on the other side. ``agents_export`` now loads each requested
+  agent's ``AgentConfig`` and returns 409 (new ``_conflict`` helper)
+  when ``cfg.state != "paused"``. Whole-batch reject — a single
+  non-paused agent in a multi-agent bundle fails the request,
+  preserving "either everything in the bundle is a consistent
+  snapshot, or nothing is." Unknown agent ids return 404 with the
+  offending id fingered in the body. Paired with the web client's
+  Export button (gated on paused) so the 409 only fires on a race
+  where the agent flipped between gate and submit.
+
+  Known limit: there is a small TOCTOU window between the paused
+  guard and ``exp.pack`` — if the agent gets resumed mid-pack the
+  snapshot is partially-inconsistent. Acceptable for P0 because the
+  only resume paths are operator-driven (visible) or the reconcile
+  loop (which respects the paused-by-operator flag). Tighten with a
+  per-agent lock if a regression surfaces.
+
+- **PUF-263: import flow now self-contained, lands the agent in
+  running state.** ``import_bundle`` registers the new device's
+  subkey immediately after enrol and persists it as a session under
+  ``keys/<slug>.session.json`` so the agent worker can sign its
+  first request without an extra ``/devices/subkeys`` round-trip.
+  ``_revoke_old_device`` reuses that pre-registered subkey instead
+  of POSTing a fresh one, so total server traffic is unchanged
+  (old subkey for enrol + new subkey for revoke). After
+  ``_commit_staging`` — whether revoke succeeded cleanly or got
+  shelved as ``pending_revoke.json`` — ``AgentConfig.save`` patches
+  ``state: paused`` (inherited from the export gate) to ``running``
+  so the operator doesn't have to click Resume on the new machine.
+  Subkey registration and the state flip are both best-effort: a
+  401 on ``/devices/subkeys`` (chain-validation lag right after
+  enrol) is logged and the import proceeds without persisting a
+  session — the worker rotates one on first request, same as a
+  fresh install. A yaml write failure on the state flip leaves the
+  agent paused but otherwise functional.
+
 - **PUF-266: codex agents now inherit the operator's host MCP catalog.**
   ``write_codex_mcp_config`` used to overwrite the per-agent
   ``$CODEX_HOME/config.toml`` with only the puffo_core stdio entry, so
