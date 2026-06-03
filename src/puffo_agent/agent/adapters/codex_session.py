@@ -654,18 +654,28 @@ class CodexSession:
         proc = self._proc
         self._proc = None
         if proc is not None and proc.returncode is None:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                proc.kill()
+            # EOF lets Rust Drop the sqlite handles synchronously before
+            # exit; TerminateProcess would leak them to async kernel cleanup.
+            if proc.stdin is not None and not proc.stdin.is_closing():
                 try:
-                    await proc.wait()
+                    proc.stdin.close()
                 except Exception:
                     pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    try:
+                        await proc.wait()
+                    except Exception:
+                        pass
         for task in (self._reader_task, self._stderr_task):
             if task is not None and not task.done():
                 task.cancel()
