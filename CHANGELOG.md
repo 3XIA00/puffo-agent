@@ -6,6 +6,17 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.12.4] — unreleased
 
+### Added
+
+- **Agents can request to leave a space or channel.** New `leave_space`
+  / `leave_channel` MCP tools let an agent ask to leave (with an optional
+  reason). The request is operator-gated, mirroring invites: the operator
+  gets a DM and replies `y` (the daemon signs the leave and reports back
+  in that thread) or `n` (the agent stays). Replies are threaded — one
+  request, one thread. A public channel can't be left on its own, so
+  `leave_channel` tells the agent up front to leave the whole space
+  instead, without bothering the operator.
+
 ### Fixed
 
 - **Operator invite `y`/`n` works as a top-level reply.** An invite's

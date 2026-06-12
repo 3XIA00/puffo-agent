@@ -26,7 +26,7 @@ from ..crypto.message import (
 from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
 from ..crypto.ws_client import PuffoCoreWsClient
 from . import disk_cache
-from ._invite_strings import format_invite_error
+from ._invite_strings import format_invite_error, format_leave_error
 from .core import AgentAPIError
 from .events import random_nonce, sign_event
 from .message_store import MessageStore
@@ -418,6 +418,7 @@ class PuffoCoreMessageClient:
         http_client: PuffoCoreHttpClient,
         message_store: MessageStore,
         operator_slug: str = "",
+        auto_accept_space_invitations: bool = False,
         workspace: str = "",
         max_inline_chars: int = 4000,
         segment_chars: int = 2000,
@@ -431,6 +432,7 @@ class PuffoCoreMessageClient:
         # Operator's slug — used to DM them on non-auto-acceptable
         # invites. Empty string falls back to log-only handling.
         self.operator_slug = operator_slug
+        self.auto_accept_space_invitations = bool(auto_accept_space_invitations)
         # Absolute path to the agent's workspace. Inbound attachments
         # are decrypted into ``<workspace>/.puffo/inbox/<envelope_id>/``.
         self.workspace = workspace
@@ -481,6 +483,11 @@ class PuffoCoreMessageClient:
         # reply in that thread can be intercepted inside the daemon.
         # In-memory only — on restart we re-DM from the next poll.
         self._pending_invite_dms: dict[str, dict[str, Any]] = {}
+        # Agent-initiated leaves awaiting operator y/n, keyed by approval-DM
+        # envelope_id. ``_gate_left_spaces`` marks gate-approved space leaves
+        # so the WS echo's ``_on_left_space`` skips its now-duplicate DM.
+        self._pending_leave_dms: dict[str, dict[str, Any]] = {}
+        self._gate_left_spaces: set[str] = set()
 
         # channel_id → space_id learned from inbound envelopes. The
         # agent's config carries one "home" space_id, but cross-space
@@ -678,6 +685,14 @@ class PuffoCoreMessageClient:
                         await self._send_invite_bulk_summary(
                             handled_labels, text_raw, payload_thread_root_id or "",
                         )
+                    return
+                # Same gate for agent-initiated leave requests, but
+                # threaded-only — each leave is confirmed in its own
+                # thread (no direct/bulk path).
+                if await self._maybe_handle_leave_reply(
+                    thread_root_id=payload_thread_root_id or "", text=text_raw,
+                ):
+                    self._last_dm_sender = payload.sender_slug
                     return
 
             channel_id = payload.channel_id or ""
@@ -1638,6 +1653,11 @@ class PuffoCoreMessageClient:
             return
         space_label = await self._resolve_space_name(space_id)
         await self._evict_space_caches(space_id)
+        # Leaves the operator already approved via the leave-request gate
+        # are reported in that DM thread; don't also send the generic one.
+        if not synthetic and space_id in self._gate_left_spaces:
+            self._gate_left_spaces.discard(space_id)
+            return
         reason = (
             "your space exit cascaded to me"
             if synthetic else "I signed a LeaveSpace"
@@ -1865,20 +1885,32 @@ class PuffoCoreMessageClient:
             return
 
         is_from_operator = await self._inviter_is_operator(inviter_slug)
-        if is_from_operator:
+        # Flag-driven auto-accept covers space invites from non-operators;
+        # unlike the (silent) operator path it DMs a report afterwards.
+        flag_accept = (
+            kind == "invite_to_space" and self.auto_accept_space_invitations
+        )
+        if is_from_operator or flag_accept:
             try:
                 await self._accept_invite(
                     kind, invitation_event_id, space_id, channel_id,
                 )
                 self._log.info(
-                    "auto-accepted %s from operator %s (event_id=%s)",
+                    "auto-accepted %s from %s (event_id=%s)",
                     kind, inviter_slug, invitation_event_id,
                 )
                 self._processed_invite_ids.add(invitation_event_id)
             except Exception:
                 self._log.exception(
-                    "failed to auto-accept %s from operator %s (event_id=%s)",
+                    "failed to auto-accept %s from %s (event_id=%s)",
                     kind, inviter_slug, invitation_event_id,
+                )
+                return
+            if not is_from_operator:
+                await self._report_auto_accepted_space_invite(
+                    inviter_slug=inviter_slug,
+                    space_id=space_id,
+                    space_name=space_name,
                 )
         else:
             try:
@@ -1895,6 +1927,31 @@ class PuffoCoreMessageClient:
                 # Mark processed even on DM failure — the operator
                 # still sees the invite in their chat client.
                 self._processed_invite_ids.add(invitation_event_id)
+
+    async def _report_auto_accepted_space_invite(
+        self, *, inviter_slug: str, space_id: str, space_name: str | None,
+    ) -> None:
+        """Tell the operator we auto-accepted a non-operator space invite
+        on their behalf (the auto_accept_space_invitations flag is on).
+        Best-effort."""
+        if not self.operator_slug:
+            return
+        space_label = f"**{space_name}**({space_id})" if space_name else space_id
+        inviter_display = await self._fetch_display_name(inviter_slug)
+        inviter_label = (
+            f"**{inviter_display}**(@{inviter_slug})"
+            if inviter_display else f"@{inviter_slug}"
+        )
+        text = (
+            f"Auto-accepted an invite to space {space_label} from "
+            f"{inviter_label} (auto-accept-space-invitations is on)."
+        )
+        try:
+            await self._send_dm(self.operator_slug, text, root_id="")
+        except Exception:
+            self._log.exception(
+                "failed to report auto-accepted space invite to operator",
+            )
 
     async def _inviter_is_operator(self, inviter_slug: str) -> bool:
         """True iff ``inviter_slug``'s root pubkey matches our
@@ -2592,6 +2649,194 @@ class PuffoCoreMessageClient:
             )
             return f"channel {channel_label} in space {space_label}"
         return f"space {space_label}"
+
+    # ── Agent-initiated leave (operator-gated, mirrors invite) ────────
+
+    async def request_leave_approval(
+        self, *, kind: str, space_id: str, channel_id: str, reason: str,
+    ) -> str:
+        """DM the operator to approve an agent-requested leave and
+        register it as pending. ``kind`` is ``leave_space`` /
+        ``leave_channel``. Returns a short status line for the calling
+        MCP tool to relay to the agent. The actual leave is signed only
+        after the operator replies ``y`` in the DM thread (the gate in
+        ``handle_envelope`` → ``_maybe_handle_leave_reply``)."""
+        if not self.operator_slug:
+            return (
+                "No operator is configured, so I can't request approval "
+                "to leave."
+            )
+        space_label = await self._resolve_space_name(space_id)
+        channel_label = ""
+        if kind == "leave_channel":
+            channel_label = await self._resolve_channel_name(
+                space_id=space_id, channel_id=channel_id,
+            )
+            # Public channels can't be left on their own; tell the agent
+            # up front instead of asking the operator for a doomed approval.
+            if await self._channel_is_public(space_id, channel_id):
+                return (
+                    f"**{channel_label}** is a public channel, which can't "
+                    f"be left on its own. To leave it, request to leave the "
+                    f"whole space instead with `leave_space`."
+                )
+            target = (
+                f"channel **{channel_label}**({channel_id}) in space "
+                f"**{space_label}**({space_id})"
+            )
+        else:
+            target = f"space **{space_label}**({space_id})"
+        reason_line = f" Reason: {reason.strip()}" if reason.strip() else ""
+        text = (
+            f"I'd like to leave {target}.{reason_line} "
+            f"Reply `y` in this thread to approve, or `n` to keep me there."
+        )
+        envelope = await self._send_dm(self.operator_slug, text, root_id="")
+        env_id = envelope.get("envelope_id", "") if envelope else ""
+        if not env_id:
+            return (
+                "I couldn't reach your operator to ask — no approval DM "
+                "was sent. Try again later."
+            )
+        self._pending_leave_dms[env_id] = {
+            "kind": kind,
+            "space_id": space_id,
+            "channel_id": channel_id,
+            "space_name": space_label,
+            "channel_name": channel_label or None,
+            "reason": reason,
+        }
+        plain = self._leave_target_label(self._pending_leave_dms[env_id])
+        return (
+            f"Asked your operator to approve leaving {plain}. "
+            f"I'll act once they reply `y` in that thread."
+        )
+
+    async def _maybe_handle_leave_reply(
+        self, *, thread_root_id: str, text: str,
+    ) -> bool:
+        """Operator ``y``/``n`` on a pending leave-request DM. Threaded
+        only — the reply must land in the approval DM's own thread.
+        Returns ``True`` when consumed (caller skips the LLM)."""
+        meta = self._pending_leave_dms.get(thread_root_id)
+        if meta is None:
+            return False
+        normalized = text.strip().lower()
+        if normalized in ("y", "yes"):
+            approved = True
+        elif normalized in ("n", "no"):
+            approved = False
+        else:
+            return False
+
+        kind = meta["kind"]
+        space_id = meta["space_id"]
+        channel_id = meta.get("channel_id") or ""
+        target = self._leave_target_label(meta)
+        if approved:
+            try:
+                await self._sign_and_post_leave(
+                    kind=kind, space_id=space_id, channel_id=channel_id,
+                )
+                # Suppress the WS echo's generic membership DM (space only);
+                # the in-thread confirm below is the authoritative report.
+                if kind == "leave_space":
+                    self._gate_left_spaces.add(space_id)
+                confirm = f"Left {target}. ✓"
+                self._log.info(
+                    "operator-approved leave of %s (space=%s channel=%s)",
+                    kind, space_id, channel_id,
+                )
+            except Exception as exc:
+                self._log.exception(
+                    "operator-approved leave of %s failed (space=%s channel=%s)",
+                    kind, space_id, channel_id,
+                )
+                confirm = f"{format_leave_error(exc)} ({target})"
+        else:
+            confirm = f"Understood — I'll stay in {target}."
+
+        self._pending_leave_dms.pop(thread_root_id, None)
+        try:
+            await self._send_dm(
+                self.operator_slug, confirm, root_id=thread_root_id,
+            )
+        except Exception:
+            self._log.exception(
+                "failed to confirm leave-reply outcome to operator",
+            )
+        return True
+
+    @staticmethod
+    def _leave_target_label(meta: dict) -> str:
+        """Human label for a leave's destination (space or channel)."""
+        space_id = meta.get("space_id") or ""
+        space_label = f"**{meta['space_name']}**" if meta.get("space_name") else space_id
+        if meta.get("kind") == "leave_channel":
+            channel_id = meta.get("channel_id") or ""
+            channel_label = (
+                f"**{meta['channel_name']}**" if meta.get("channel_name") else channel_id
+            )
+            return f"channel {channel_label} in space {space_label}"
+        return f"space {space_label}"
+
+    async def _channel_is_public(
+        self, space_id: str, channel_id: str,
+    ) -> bool | None:
+        """Whether ``channel_id`` is public (and so can't be left on its
+        own). ``True``/``False`` from ``GET /spaces/<id>/channels``;
+        ``None`` when undeterminable, so callers fall through to the
+        normal approval path rather than blocking on a flake."""
+        if not space_id or not channel_id:
+            return None
+        try:
+            data = await self.http.get(f"/spaces/{space_id}/channels")
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        for entry in data.get("channels") or []:
+            if (entry.get("channel_id") or "") == channel_id:
+                return bool(entry.get("is_public"))
+        return None
+
+    async def _sign_and_post_leave(
+        self, *, kind: str, space_id: str, channel_id: str,
+    ) -> None:
+        """Sign + POST a ``leave_space`` / ``leave_channel`` event.
+        Mirrors ``_accept_invite``'s signing; the leave payload uses
+        ``effective_from`` (not ``accepted_at``) and the server rejects
+        unknown fields, so the shapes are exact."""
+        sess = self.keystore.load_session(self.slug)
+        signing_key = Ed25519KeyPair.from_secret_bytes(
+            decode_secret(sess.subkey_secret_key)
+        )
+        now_ms = int(__import__("time").time() * 1000)
+        if kind == "leave_channel":
+            payload: dict[str, Any] = {
+                "space_id": space_id,
+                "channel_id": channel_id,
+                "effective_from": now_ms,
+                "nonce": random_nonce(),
+            }
+        else:
+            payload = {
+                "space_id": space_id,
+                "effective_from": now_ms,
+                "nonce": random_nonce(),
+            }
+        signed = sign_event(
+            kind=kind,
+            payload=payload,
+            signer_slug=self.slug,
+            signer_device_id=self.device_id,
+            signer_subkey_id=sess.subkey_id,
+            signing_key=signing_key,
+        )
+        await self.http.post(
+            "/spaces/events",
+            {"space_id": space_id, "events": [signed]},
+        )
 
     async def _maybe_handle_invite_reply(
         self, *, thread_root_id: str, text: str,
