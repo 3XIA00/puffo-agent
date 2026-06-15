@@ -602,3 +602,91 @@ while True:
     # 10s graceful + 3s terminate window + slack for slow CI.
     elapsed = asyncio.run(_run())
     assert elapsed < 20.0, f"aclose hung for {elapsed:.1f}s"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sandbox policy — thread/start carries the configured sandbox; adapter
+# sanitises unknown values
+# ─────────────────────────────────────────────────────────────────────────────
+
+SANDBOX_SCRIPT = '''\
+absorb_initialize()
+
+msg = r()
+assert msg["method"] == "thread/start"
+assert msg["params"]["sandbox"] == "workspace-write", \\
+    f"sandbox was {msg['params'].get('sandbox')!r}"
+assert msg["params"]["approvalPolicy"] == "never"
+w({"jsonrpc": "2.0", "id": msg["id"],
+   "result": {"thread": {"id": "conv_sb", "createdAt": "2026-05-15T00:00:00Z"}}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+'''
+
+
+def test_thread_start_carries_configured_sandbox(tmp_path):
+    fake = _write_fake(tmp_path, SANDBOX_SCRIPT)
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+        sandbox="workspace-write",
+    )
+
+    async def _run():
+        # The fake asserts sandbox/approvalPolicy on thread/start — a
+        # mismatch crashes it, so warm() fails.
+        await cs.warm("system prompt v1")
+        await cs.aclose()
+
+    asyncio.run(_run())
+
+
+def test_sanitise_sandbox_falls_back_on_unknown():
+    from puffo_agent.agent.adapters.local_cli import _sanitise_sandbox
+
+    assert _sanitise_sandbox("workspace-write", "a") == "workspace-write"
+    assert _sanitise_sandbox("read-only", "a") == "read-only"
+    assert _sanitise_sandbox("danger-full-access", "a") == "danger-full-access"
+    assert _sanitise_sandbox("bogus", "a") == "danger-full-access"
+    assert _sanitise_sandbox("", "a") == "danger-full-access"
+
+
+def test_codex_sandbox_change_resets_persisted_thread(tmp_path):
+    sf = tmp_path / "codex_session.json"
+    sf.write_text(
+        json.dumps({"conversation_id": "old_thread", "sandbox": "danger-full-access"}),
+        encoding="utf-8",
+    )
+    cs = CodexSession(
+        agent_id="a", session_file=sf, argv=["x"], sandbox="workspace-write",
+    )
+    assert cs._conversation_id == ""  # changed → fresh thread next start
+
+
+def test_codex_same_sandbox_keeps_persisted_thread(tmp_path):
+    sf = tmp_path / "codex_session.json"
+    sf.write_text(
+        json.dumps({"conversation_id": "old_thread", "sandbox": "workspace-write"}),
+        encoding="utf-8",
+    )
+    cs = CodexSession(
+        agent_id="a", session_file=sf, argv=["x"], sandbox="workspace-write",
+    )
+    assert cs._conversation_id == "old_thread"  # unchanged → resume
+
+
+def test_codex_legacy_session_file_treated_as_full_access(tmp_path):
+    # Pre-feature file: only conversation_id, no sandbox → danger-full-access.
+    sf = tmp_path / "codex_session.json"
+    sf.write_text(json.dumps({"conversation_id": "old_thread"}), encoding="utf-8")
+    keep = CodexSession(agent_id="a", session_file=sf, argv=["x"])
+    assert keep._conversation_id == "old_thread"  # still full-access → resume
+    reset = CodexSession(
+        agent_id="a", session_file=sf, argv=["x"], sandbox="workspace-write",
+    )
+    assert reset._conversation_id == ""  # now differs → reset
