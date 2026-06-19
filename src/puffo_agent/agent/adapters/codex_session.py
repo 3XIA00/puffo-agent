@@ -99,6 +99,35 @@ _CODEX_THREAD_LIMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
 def _looks_like_codex_thread_limit(err_text: str) -> bool:
     return any(p.search(err_text or "") for p in _CODEX_THREAD_LIMIT_PATTERNS)
 
+
+# Verbatim Codex auth-failure signals — anchored so we don't auto-flip on
+# legitimate model/quota errors. ``invalid thread id ... found 0`` is a
+# downstream symptom of an empty conversation_id, not auth — kept out.
+_CODEX_AUTH_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"refresh token (?:was )?revoked", re.IGNORECASE),
+    re.compile(r"\btoken_invalidated\b", re.IGNORECASE),
+)
+
+# ``401`` next to ``/responses`` in the same clause (bounded distance, no
+# sentence break between), either ordering. Clause-bound so it doesn't FP
+# on unrelated lines that happen to mention both fragments.
+_CODEX_RESPONSES_401_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"/responses[^.;\n]{0,40}\b401\b", re.IGNORECASE),
+    re.compile(r"\b401\b[^.;\n]{0,40}/responses", re.IGNORECASE),
+)
+
+
+def _looks_like_codex_auth_error(err_text: str) -> bool:
+    """True iff ``err_text`` carries a verbatim Codex auth signal
+    (``refresh token (was) revoked`` / ``token_invalidated`` / a
+    ``/responses 401`` clause-bound co-occurrence). Drives converting a
+    ``turn_failed`` into an ``AgentAPIError(is_auth=True)`` so the worker's
+    auth_failed substrate fires."""
+    text = err_text or ""
+    if any(p.search(text) for p in _CODEX_AUTH_ERROR_PATTERNS):
+        return True
+    return any(p.search(text) for p in _CODEX_RESPONSES_401_PATTERNS)
+
 # Tool names of the puffo MCP server's "this counts as posting a
 # reply" family. When the agent invokes one of these and it completes
 # successfully, the worker treats the turn as "agent already replied"
@@ -329,9 +358,19 @@ class CodexSession:
             self._active_turn = None
 
         if turn_failed_exc is not None:
+            err_text = str(turn_failed_exc)
             self._propagate_turn_outcome(
-                outcome="turn_failed", err_text=str(turn_failed_exc),
+                outcome="turn_failed", err_text=err_text,
             )
+            # Codex auth-failures are sticky + operator-actionable (re-run
+            # ``codex login``). Convert to AgentAPIError so the worker's
+            # auth_failed substrate (state-flip + operator DM + refresher
+            # kick) reuses the Claude path.
+            if _looks_like_codex_auth_error(err_text):
+                from ..core import AgentAPIError
+                raise AgentAPIError(
+                    f"codex auth failed: {err_text}", is_auth=True,
+                ) from turn_failed_exc
             raise turn_failed_exc
 
         reply = "".join(turn.reply_chunks).strip()
