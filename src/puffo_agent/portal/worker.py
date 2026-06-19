@@ -624,6 +624,50 @@ class Worker:
                 "agent %s: notify_refresh_needed raised: %s", agent_id, exc,
             )
 
+    async def _run_post_warm_gate(self, agent_id: str) -> None:
+        """Probe the adapter's round-trip readiness after warm() succeeds,
+        reassert ``auth_failed`` if the provider's still unreachable, THEN
+        release ``_warm_done``. Order matters — releasing first would let a
+        queued message dispatch against an unprobed runtime."""
+        try:
+            probe_ok = await self._adapter.health_probe()
+        except Exception as exc:
+            logger.warning(
+                "agent %s: health_probe raised; treating as "
+                "probe-fail: %s", agent_id, exc,
+            )
+            probe_ok = False
+        if not probe_ok:
+            Worker._reassert_auth_failed_after_failed_probe(
+                self.runtime, agent_id, logger,
+            )
+        self._warm_done.set()
+
+    @staticmethod
+    def _reassert_auth_failed_after_failed_probe(
+        runtime: "RuntimeState",
+        agent_id: str,
+        log: logging.Logger,
+    ) -> None:
+        """``on_refresh_success`` eagerly clears ``auth_failed`` before
+        the respawn, so a still-broken provider warms up looking healthy.
+        When the post-warm probe fails, re-assert the failed state so the
+        next refresh cycle retries. No-op unless the runtime is in the
+        eager-cleared ``ok`` state."""
+        if runtime.health != "ok":
+            return
+        runtime.health = "auth_failed"
+        runtime.error = (
+            "post-recovery health probe failed — provider still "
+            "unreachable; waiting for next credential refresh"
+        )
+        runtime.save(agent_id)
+        log.warning(
+            "agent %s: post-warm health probe failed; reasserted "
+            "runtime.health = auth_failed",
+            agent_id,
+        )
+
     def _enter_auth_failed(self, agent_id: str) -> None:
         """Flip ``auth_failed`` + fire recovery (refresher kick + operator
         DM). Used on a confirmed adapter auth error so we skip the
@@ -1033,14 +1077,21 @@ class Worker:
 
         # Warm the adapter so persisted-session agents re-spawn their
         # subprocess now rather than on the first DM. Non-fatal.
+        warm_ok = False
         try:
             await self._adapter.warm(claude_md)
+            warm_ok = True
         except Exception as exc:
             logger.warning(
                 "agent %s: warm() failed (will retry on first turn): %s",
                 agent_id, exc,
             )
-        finally:
+        if warm_ok:
+            await self._run_post_warm_gate(agent_id)
+        else:
+            # Warm failed; release the startup gate so the daemon's
+            # wait_warm doesn't block forever. Probe would have nothing
+            # to verify anyway since the adapter never came up.
             self._warm_done.set()
 
         reload_flag_path = Path(workspace_path) / ".puffo-agent" / "reload.flag"

@@ -103,6 +103,13 @@ class Adapter(ABC):
         """
         return None
 
+    async def health_probe(self) -> bool:
+        """Verify the runtime can reach its provider after a recovery
+        respawn — the worker calls it once post-``warm()`` to reassert
+        ``auth_failed`` if the round-trip still fails. Default-True;
+        only the Codex override does a real subprocess/thread probe."""
+        return True
+
 
 def format_history_as_prompt(messages: list[dict]) -> str:
     """Render shell conversation history as a single prompt string.

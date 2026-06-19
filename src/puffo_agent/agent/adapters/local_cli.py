@@ -311,6 +311,15 @@ class LocalCLIAdapter(Adapter):
             await self._codex_session.aclose()
             self._codex_session = None
 
+    async def health_probe(self) -> bool:
+        """Delegate to the Codex session probe when one exists; other
+        harnesses (claude-code, hermes, gemini-cli) inherit the True
+        default — their next inbound message surfaces a real auth
+        failure via the worker leak-filter as before."""
+        if self._codex_session is not None:
+            return await self._codex_session.health_probe()
+        return True
+
     def _ensure_codex_session(self) -> CodexSession:
         if self._codex_session is not None:
             return self._codex_session
