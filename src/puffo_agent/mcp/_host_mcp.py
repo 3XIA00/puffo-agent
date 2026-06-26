@@ -25,6 +25,12 @@ class PuffoRpcClient:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
+            # Match the bare-address repr aiohttp gc-emits on a leak.
+            logger.info(
+                "aiohttp ClientSession created (class=PuffoRpcClient "
+                "base_url=%s agent_id=%s)",
+                self.base_url, self.agent_id,
+            )
         return self._session
 
     async def close(self) -> None:
