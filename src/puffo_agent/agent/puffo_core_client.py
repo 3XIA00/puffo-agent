@@ -29,6 +29,7 @@ from . import disk_cache
 from ._invite_strings import format_invite_error, format_leave_error
 from .core import AgentAPIError
 from .events import random_nonce, sign_event
+from .event_kinds import EventKind
 from .message_store import MessageStore
 
 logger = logging.getLogger(__name__)
@@ -511,6 +512,9 @@ class PuffoCoreMessageClient:
         # invite. Lost on daemon restart (acceptable: re-DM rate is
         # naturally rare).
         self._processed_invite_ids: set[str] = set()
+        self._processed_membership_event_ids: set[str] = set()
+        # Fallback for manual-accept events that omit ``original_invite``.
+        self._inviter_by_invitation_event_id: dict[str, str] = {}
         # When the worker DMs the operator about a non-auto-acceptable
         # invite, the DM's envelope_id lives here so a ``y``/``n``
         # reply in that thread can be intercepted inside the daemon.
@@ -1463,12 +1467,22 @@ class PuffoCoreMessageClient:
         # is removed so the next mention extraction re-fetches; without
         # this the cache misses the new joiner and their @-mention is
         # silently dropped from the metadata.
-        if kind in ("accept_space_invite", "leave_space", "remove_from_space"):
+        if kind in (
+            EventKind.ACCEPT_SPACE_INVITE,
+            EventKind.LEAVE_SPACE,
+            EventKind.REMOVE_FROM_SPACE,
+        ):
             evict_space_id = payload.get("space_id") or ""
             if evict_space_id:
                 self._space_members.pop(evict_space_id, None)
 
-        if kind in ("invite_to_space", "invite_to_channel"):
+        if kind in (EventKind.INVITE_TO_SPACE, EventKind.INVITE_TO_CHANNEL):
+            invite_event_id = event.get("event_id") or ""
+            inviter_slug = event.get("signer_slug") or ""
+            if invite_event_id and inviter_slug:
+                self._inviter_by_invitation_event_id[invite_event_id] = (
+                    inviter_slug
+                )
             if payload.get("invitee_slug") != self.slug:
                 return  # Server fans the event to space members too.
             await self._poll_pending_invites()
@@ -1484,9 +1498,14 @@ class PuffoCoreMessageClient:
         # runs, so the self-intro nudge that path normally fires
         # would otherwise be silently dropped on auto-accept.
         # Mirror just the nudge here.
-        if kind == "accept_channel_invite":
+        if kind == EventKind.ACCEPT_CHANNEL_INVITE:
             if event.get("signer_slug") != self.slug:
-                return  # Someone else's accept — not our business.
+                # Another member joined a channel we may also be in
+                # — fall through to the announce-membership path.
+                await self._maybe_announce_membership_change(
+                    kind, event, payload,
+                )
+                return
             # Distinguish the server-emitted synthetic from a
             # real signed accept that's bouncing back over WS.
             # ``original_invite`` is the canonical marker — the
@@ -1517,7 +1536,7 @@ class PuffoCoreMessageClient:
         # the server emits when an operator leaves (puffo-server #74
         # agent-cascade) is signed-as-the-agent — same predicate as
         # a real self-signed leave, so it lands in the same branch.
-        if kind == "leave_space" and event.get("signer_slug") == self.slug:
+        if kind == EventKind.LEAVE_SPACE and event.get("signer_slug") == self.slug:
             await self._on_left_space(
                 space_id=payload.get("space_id") or "",
                 synthetic=str(event.get("signature") or "").startswith(
@@ -1526,24 +1545,42 @@ class PuffoCoreMessageClient:
             )
             return
 
-        if kind == "remove_from_space" and payload.get("removed_slug") == self.slug:
+        if kind == EventKind.REMOVE_FROM_SPACE and payload.get("removed_slug") == self.slug:
             await self._on_kicked_from_space(
                 space_id=payload.get("space_id") or "",
                 kicker_slug=event.get("signer_slug") or "",
             )
             return
 
-        if kind == "leave_channel" and event.get("signer_slug") == self.slug:
+        if kind == EventKind.LEAVE_CHANNEL and event.get("signer_slug") == self.slug:
             await self._on_left_channel(
                 channel_id=payload.get("channel_id") or "",
             )
             return
 
-        if kind == "remove_from_channel" and payload.get("removed_slug") == self.slug:
+        if kind == EventKind.REMOVE_FROM_CHANNEL and payload.get("removed_slug") == self.slug:
             await self._on_kicked_from_channel(
                 channel_id=payload.get("channel_id") or "",
                 space_id=payload.get("space_id") or "",
                 kicker_slug=event.get("signer_slug") or "",
+            )
+            return
+
+        if kind in (EventKind.LEAVE_CHANNEL, EventKind.REMOVE_FROM_CHANNEL):
+            await self._maybe_announce_membership_change(
+                kind, event, payload,
+            )
+            return
+
+        # Space cascades silently into channel_memberships server-side
+        # — surface here so #general transcript stays current.
+        if kind in (
+            EventKind.LEAVE_SPACE,
+            EventKind.REMOVE_FROM_SPACE,
+            EventKind.ACCEPT_SPACE_INVITE,
+        ):
+            await self._maybe_announce_space_membership_change(
+                kind, event, payload,
             )
             return
 
@@ -1552,10 +1589,10 @@ class PuffoCoreMessageClient:
         # added to ``extra_ws_targets`` for cancel/reject). If the
         # operator is still holding an un-answered y/n DM, follow up
         # so they don't reply ``y`` to a dead invite.
-        if kind in ("cancel_space_invite", "cancel_channel_invite"):
+        if kind in (EventKind.CANCEL_SPACE_INVITE, EventKind.CANCEL_CHANNEL_INVITE):
             await self._on_invite_canceled(
                 invitation_event_id=payload.get("invitation_event_id") or "",
-                scope="space" if kind == "cancel_space_invite" else "channel",
+                scope="space" if kind == EventKind.CANCEL_SPACE_INVITE else "channel",
             )
             return
 
@@ -1571,13 +1608,13 @@ class PuffoCoreMessageClient:
         space_id = payload.get("space_id") or ""
         if not channel_id or not space_id:
             return
-        if kind == "invite_to_channel":
+        if kind == EventKind.INVITE_TO_CHANNEL:
             if payload.get("invitee_slug") != self.slug:
                 return
-        elif kind == "accept_channel_invite":
+        elif kind == EventKind.ACCEPT_CHANNEL_INVITE:
             if event.get("signer_slug") != self.slug:
                 return
-        elif kind == "create_channel":
+        elif kind == EventKind.CREATE_CHANNEL:
             pass  # always cache; server only fans to space members
         else:
             return
@@ -1908,7 +1945,7 @@ class PuffoCoreMessageClient:
                 kind, invitation_event_id, inviter_slug, space_id,
             )
             return
-        if kind == "invite_to_channel" and not channel_id:
+        if kind == EventKind.INVITE_TO_CHANNEL and not channel_id:
             self._log.warning(
                 "channel invite missing channel_id: event_id=%s",
                 invitation_event_id,
@@ -1921,7 +1958,7 @@ class PuffoCoreMessageClient:
         # Flag-driven auto-accept covers space invites from non-operators;
         # unlike the (silent) operator path it DMs a report afterwards.
         flag_accept = (
-            kind == "invite_to_space" and self.auto_accept_space_invitations
+            kind == EventKind.INVITE_TO_SPACE and self.auto_accept_space_invitations
         )
         if is_from_operator or flag_accept:
             try:
@@ -2369,14 +2406,14 @@ class PuffoCoreMessageClient:
             decode_secret(sess.subkey_secret_key)
         )
         now_ms = int(__import__("time").time() * 1000)
-        if kind == "invite_to_space":
+        if kind == EventKind.INVITE_TO_SPACE:
             payload: dict[str, Any] = {
                 "space_id": space_id,
                 "invitation_event_id": invitation_event_id,
                 "accepted_at": now_ms,
                 "nonce": random_nonce(),
             }
-            accept_kind = "accept_space_invite"
+            accept_kind = EventKind.ACCEPT_SPACE_INVITE
         else:  # invite_to_channel
             payload = {
                 "space_id": space_id,
@@ -2385,7 +2422,7 @@ class PuffoCoreMessageClient:
                 "accepted_at": now_ms,
                 "nonce": random_nonce(),
             }
-            accept_kind = "accept_channel_invite"
+            accept_kind = EventKind.ACCEPT_CHANNEL_INVITE
         signed = sign_event(
             kind=accept_kind,
             payload=payload,
@@ -2406,7 +2443,7 @@ class PuffoCoreMessageClient:
         # ``send_message`` call (queued right below) could race the
         # WS echo and hit a cache miss on a channel the agent has
         # just provably joined.
-        if kind == "invite_to_channel" and channel_id and space_id:
+        if kind == EventKind.INVITE_TO_CHANNEL and channel_id and space_id:
             try:
                 await self.store.mark_channel_space(channel_id, space_id)
             except Exception:
@@ -2424,9 +2461,9 @@ class PuffoCoreMessageClient:
         # auto-fanned-out into per puffo-server's space-invite redeem
         # logic — any other channel needs its own invite_to_channel).
         intro_channel_id = ""
-        if kind == "invite_to_channel" and channel_id:
+        if kind == EventKind.INVITE_TO_CHANNEL and channel_id:
             intro_channel_id = channel_id
-        elif kind == "invite_to_space":
+        elif kind == EventKind.INVITE_TO_SPACE:
             try:
                 intro_channel_id = await self._find_public_general_channel(
                     space_id,
@@ -2619,6 +2656,328 @@ class PuffoCoreMessageClient:
             channel_id, space_id,
         )
 
+    async def _maybe_announce_membership_change(
+        self, kind: str, event: dict, payload: dict,
+    ) -> None:
+        """System row for other-actor channel membership. Dedup'd by event_id."""
+        channel_id = payload.get("channel_id") or ""
+        if not channel_id or channel_id not in self._channel_space:
+            return
+
+        inviter_slug = ""
+        if kind == EventKind.ACCEPT_CHANNEL_INVITE:
+            actor_slug = event.get("signer_slug") or ""
+            action = "joined"
+            kicker_slug = ""
+            original_invite = payload.get("original_invite")
+            if isinstance(original_invite, dict):
+                inviter_slug = original_invite.get("signer_slug") or ""
+            if not inviter_slug:
+                invitation_event_id = payload.get("invitation_event_id") or ""
+                if invitation_event_id:
+                    inviter_slug = self._inviter_by_invitation_event_id.get(
+                        invitation_event_id, "",
+                    )
+        elif kind == EventKind.LEAVE_CHANNEL:
+            actor_slug = event.get("signer_slug") or ""
+            action = "left"
+            kicker_slug = ""
+        elif kind == EventKind.REMOVE_FROM_CHANNEL:
+            actor_slug = payload.get("removed_slug") or ""
+            action = "removed"
+            kicker_slug = event.get("signer_slug") or ""
+        else:
+            return
+
+        if not actor_slug or actor_slug == self.slug:
+            return
+
+        event_id = event.get("event_id") or ""
+        if event_id and event_id in self._processed_membership_event_ids:
+            return
+
+        try:
+            await self._enqueue_membership_system_message(
+                channel_id=channel_id,
+                actor_slug=actor_slug,
+                action=action,
+                kicker_slug=kicker_slug,
+                inviter_slug=inviter_slug,
+                event_id=event_id,
+            )
+        except Exception:
+            self._log.exception(
+                "failed to enqueue membership system-message "
+                "(kind=%s channel=%s actor=%s)",
+                kind, channel_id, actor_slug,
+            )
+            return
+
+        if event_id:
+            self._processed_membership_event_ids.add(event_id)
+
+    async def _pick_space_channel(self, space_id: str) -> str:
+        """Pick #general for the space-event announce target, falling
+        back to lex-first. Tries ``_channel_space`` first (in-memory
+        from prior per-channel events); if that's empty (e.g. the agent
+        cascade-joined via ``accept_space_invite``), fetches the
+        channel list and warms ``_channel_space`` for next time.
+        Returns "" if nothing usable found."""
+        known = sorted(
+            cid for cid, sid in self._channel_space.items()
+            if sid == space_id
+        )
+        if known:
+            for cid in known:
+                name = await self._resolve_channel_name(
+                    space_id=space_id, channel_id=cid,
+                )
+                if (name or "").strip().lower() == "general":
+                    return cid
+            return known[0]
+        try:
+            data = await self.http.get(f"/spaces/{space_id}/channels")
+        except Exception:
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        channels = data.get("channels") or []
+        if not isinstance(channels, list) or not channels:
+            return ""
+        general = ""
+        first = ""
+        for c in channels:
+            if not isinstance(c, dict):
+                continue
+            cid = (c.get("channel_id") or "").strip()
+            if not cid:
+                continue
+            self._channel_space[cid] = space_id
+            name = (c.get("name") or "").strip()
+            if name:
+                self._channel_name_cache.setdefault(cid, name)
+            if not first:
+                first = cid
+            if not general and name.lower() == "general":
+                general = cid
+        return general or first
+
+    async def _maybe_announce_space_membership_change(
+        self, kind: str, event: dict, payload: dict,
+    ) -> None:
+        """System row for other-actor space membership. Renders in
+        #general (lex-first visible channel as fallback)."""
+        space_id = payload.get("space_id") or ""
+        if not space_id:
+            return
+
+        # ``accept_space_invite`` cascades the agent into public channels
+        # server-side without per-channel events, so ``_channel_space``
+        # stays empty for those. Lazy-fetch the channel list so we can
+        # still announce.
+        target_channel_id = await self._pick_space_channel(space_id)
+        if not target_channel_id:
+            return
+
+        inviter_slug = ""
+        if kind == EventKind.ACCEPT_SPACE_INVITE:
+            actor_slug = event.get("signer_slug") or ""
+            action = "joined_space"
+            kicker_slug = ""
+            original_invite = payload.get("original_invite")
+            if isinstance(original_invite, dict):
+                inviter_slug = original_invite.get("signer_slug") or ""
+            if not inviter_slug:
+                invitation_event_id = payload.get("invitation_event_id") or ""
+                if invitation_event_id:
+                    inviter_slug = self._inviter_by_invitation_event_id.get(
+                        invitation_event_id, "",
+                    )
+        elif kind == EventKind.LEAVE_SPACE:
+            actor_slug = event.get("signer_slug") or ""
+            action = "left_space"
+            kicker_slug = ""
+        elif kind == EventKind.REMOVE_FROM_SPACE:
+            actor_slug = payload.get("removed_slug") or ""
+            action = "removed_from_space"
+            kicker_slug = event.get("signer_slug") or ""
+        else:
+            return
+
+        if not actor_slug or actor_slug == self.slug:
+            return
+
+        event_id = event.get("event_id") or ""
+        if event_id and event_id in self._processed_membership_event_ids:
+            return
+
+        try:
+            await self._enqueue_membership_system_message(
+                channel_id=target_channel_id,
+                actor_slug=actor_slug,
+                action=action,
+                kicker_slug=kicker_slug,
+                inviter_slug=inviter_slug,
+                event_id=event_id,
+            )
+        except Exception:
+            self._log.exception(
+                "failed to enqueue space membership system-message "
+                "(kind=%s space=%s actor=%s)",
+                kind, space_id, actor_slug,
+            )
+            return
+
+        if event_id:
+            self._processed_membership_event_ids.add(event_id)
+
+    async def _enqueue_membership_system_message(
+        self,
+        *,
+        channel_id: str,
+        actor_slug: str,
+        action: str,
+        kicker_slug: str = "",
+        inviter_slug: str = "",
+        event_id: str = "",
+    ) -> None:
+        """Non-replyable system row for a membership change."""
+        space_id = self._channel_space.get(channel_id) or ""
+        space_name = (
+            await self._resolve_space_name(space_id) if space_id else ""
+        )
+        channel_name = await self._resolve_channel_name(
+            space_id=space_id, channel_id=channel_id,
+        )
+        actor_display = await self._fetch_display_name(actor_slug)
+        actor_label = (
+            f"**{actor_display}**(@{actor_slug})"
+            if actor_display else f"@{actor_slug}"
+        )
+        space_label = (
+            f"**{space_name}**" if space_name else (space_id or "the space")
+        )
+
+        async def _invited_by_suffix() -> str:
+            if not inviter_slug:
+                return ""
+            inviter_display = await self._fetch_display_name(inviter_slug)
+            inviter_label = (
+                f"**{inviter_display}**(@{inviter_slug})"
+                if inviter_display else f"@{inviter_slug}"
+            )
+            return f" (invited by {inviter_label})"
+
+        if action == "joined":
+            suffix = await _invited_by_suffix()
+            body = f"{actor_label} joined channel #{channel_name}{suffix}."
+        elif action == "left":
+            body = f"{actor_label} left channel #{channel_name}."
+        elif action == "removed":
+            kicker_display = (
+                await self._fetch_display_name(kicker_slug)
+                if kicker_slug else ""
+            )
+            kicker_label = (
+                f"**{kicker_display}**(@{kicker_slug})"
+                if kicker_display
+                else f"@{kicker_slug}" if kicker_slug else "an operator"
+            )
+            body = (
+                f"{actor_label} was removed from channel "
+                f"#{channel_name} by {kicker_label}."
+            )
+        elif action == "joined_space":
+            suffix = await _invited_by_suffix()
+            body = f"{actor_label} joined space {space_label}{suffix}."
+        elif action == "left_space":
+            body = f"{actor_label} left space {space_label}."
+        elif action == "removed_from_space":
+            kicker_display = (
+                await self._fetch_display_name(kicker_slug)
+                if kicker_slug else ""
+            )
+            kicker_label = (
+                f"**{kicker_display}**(@{kicker_slug})"
+                if kicker_display
+                else f"@{kicker_slug}" if kicker_slug else "an operator"
+            )
+            body = (
+                f"{actor_label} was removed from space "
+                f"{space_label} by {kicker_label}."
+            )
+        else:
+            return
+
+        now_ms = int(time.time() * 1000)
+        # Deterministic suffix → INSERT OR IGNORE dedups reconnect-replay.
+        envelope_id_suffix = event_id or str(now_ms)
+        envelope_id = (
+            f"membership-{action}-{channel_id}-{actor_slug}-{envelope_id_suffix}"
+        )
+        prompt_text = (
+            f"[puffo-agent system message] Channel membership update: "
+            f"{body} This is an announcement, for your context."
+        )
+
+        msg_dict = {
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "space_id": space_id,
+            "space_name": space_name,
+            "sender_slug": "system",
+            "sender_display_name": "",
+            "sender_email": "",
+            "text": prompt_text,
+            "root_id": "",
+            "is_dm": False,
+            "attachments": [],
+            "sender_is_bot": False,
+            "mentions": [],
+            "envelope_id": envelope_id,
+            "sent_at": now_ms,
+        }
+        channel_meta = {
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "space_id": space_id,
+            "space_name": space_name,
+            "is_dm": False,
+        }
+
+        store_payload = {
+            "envelope_id": envelope_id,
+            "envelope_kind": "channel",
+            "sender_slug": "system",
+            "channel_id": channel_id,
+            "space_id": space_id,
+            "content_type": "text/plain",
+            "content": prompt_text,
+            "sent_at": now_ms,
+            "thread_root_id": envelope_id,
+            "reply_to_id": None,
+        }
+        try:
+            await self.store.store(store_payload)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning(
+                "membership system-message: failed to persist "
+                "envelope=%s to messages.db: %s",
+                envelope_id, exc,
+            )
+
+        await self._admit_thread_message(
+            root_id=envelope_id,
+            priority=PRIORITY_SYSTEM,
+            msg_dict=msg_dict,
+            channel_meta=channel_meta,
+        )
+        self._log.info(
+            "enqueued membership system-message channel=%s "
+            "actor=%s action=%s",
+            channel_id, actor_slug, action,
+        )
+
     def _resolve_invite_targets(
         self, payload_thread_root_id: str | None, text: str,
     ) -> tuple[list[str], bool]:
@@ -2701,7 +3060,7 @@ class PuffoCoreMessageClient:
             )
         space_label = await self._resolve_space_name(space_id)
         channel_label = ""
-        if kind == "leave_channel":
+        if kind == EventKind.LEAVE_CHANNEL:
             channel_label = await self._resolve_channel_name(
                 space_id=space_id, channel_id=channel_id,
             )
@@ -2773,7 +3132,7 @@ class PuffoCoreMessageClient:
                 )
                 # Suppress the WS echo's generic membership DM (space only);
                 # the in-thread confirm below is the authoritative report.
-                if kind == "leave_space":
+                if kind == EventKind.LEAVE_SPACE:
                     self._gate_left_spaces.add(space_id)
                 confirm = f"Left {target}. ✓"
                 self._log.info(
@@ -2845,7 +3204,7 @@ class PuffoCoreMessageClient:
             decode_secret(sess.subkey_secret_key)
         )
         now_ms = int(__import__("time").time() * 1000)
-        if kind == "leave_channel":
+        if kind == EventKind.LEAVE_CHANNEL:
             payload: dict[str, Any] = {
                 "space_id": space_id,
                 "channel_id": channel_id,
@@ -2965,14 +3324,14 @@ class PuffoCoreMessageClient:
             decode_secret(sess.subkey_secret_key)
         )
         now_ms = int(__import__("time").time() * 1000)
-        if kind == "invite_to_space":
+        if kind == EventKind.INVITE_TO_SPACE:
             payload: dict[str, Any] = {
                 "space_id": space_id,
                 "invitation_event_id": invitation_event_id,
                 "rejected_at": now_ms,
                 "nonce": random_nonce(),
             }
-            reject_kind = "reject_space_invite"
+            reject_kind = EventKind.REJECT_SPACE_INVITE
         else:  # invite_to_channel
             payload = {
                 "space_id": space_id,
@@ -2981,7 +3340,7 @@ class PuffoCoreMessageClient:
                 "rejected_at": now_ms,
                 "nonce": random_nonce(),
             }
-            reject_kind = "reject_channel_invite"
+            reject_kind = EventKind.REJECT_CHANNEL_INVITE
         signed = sign_event(
             kind=reject_kind,
             payload=payload,
@@ -3026,7 +3385,7 @@ class PuffoCoreMessageClient:
             if inviter_display else f"@{inviter_slug}"
         )
         space_label = f"**{space_name}**({space_id})" if space_name else space_id
-        if kind == "invite_to_space":
+        if kind == EventKind.INVITE_TO_SPACE:
             text = (
                 f"{inviter_label} invited me to space {space_label}. "
                 f"They aren't my registered operator. "

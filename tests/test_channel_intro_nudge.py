@@ -51,6 +51,11 @@ def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
     # /channels response so the immediately-following
     # ``_resolve_channel_name`` inside the intro nudge becomes a hit.
     client._channel_name_cache = {}
+    # Read by ``_maybe_announce_membership_change`` on the OTHER-signer
+    # accept_channel_invite path; empty so the predicate bails cleanly.
+    client._channel_space = {}
+    # Written by ``_handle_event``'s ``invite_to_*`` branch.
+    client._inviter_by_invitation_event_id = {}
 
     async def _stub_space_name(space_id: str) -> str:
         return "Team" if space_id == "sp_1" else space_id
