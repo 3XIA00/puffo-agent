@@ -163,14 +163,17 @@ async def await_link_approval(
 
 async def migrate_owned_agents(operator_root_pubkey: str) -> int:
     """Stamp this machine's ``machine_id`` onto every agent owned by the
-    operator so puffo-server flips them from local to remote — a paused/running
-    local agent becomes remotely manageable without re-creating it. Idempotent
-    and best-effort per agent. Returns the number reported."""
+    operator so puffo-server flips them from local to remote, and PATCH
+    each agent's ``soul`` (profile.md contents) to ``/identities/self``
+    so the web profile pane renders it. Idempotent + best-effort per
+    agent — a soul-sync failure doesn't unwind the machine_id stamp.
+    Returns the number reported."""
     machine_id = current_machine_id()
     if not machine_id:
         return 0
     from ...crypto.http_client import HttpError, PuffoCoreHttpClient
     from ...crypto.keystore import KeyStore
+    from ..profile_sync import sync_agent_profile
 
     reported = 0
     for agent_id in discover_agents():
@@ -196,8 +199,41 @@ async def migrate_owned_agents(operator_root_pubkey: str) -> int:
             logger.warning(
                 "migrate %s: machine_id stamp rejected (HTTP %s)", cfg.id, exc.status
             )
+            # If /heartbeat refused us the soul PATCH will too — skip
+            # to keep error-log volume sane on a degraded server.
+            await http.close()
+            continue
         except Exception as exc:  # noqa: BLE001 — best-effort; other agents proceed
             logger.warning("migrate %s: machine_id stamp failed: %s", cfg.id, exc)
+            await http.close()
+            continue
+
+        try:
+            profile_path = cfg.resolve_profile_path()
+            try:
+                soul_text = profile_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                logger.debug(
+                    "migrate %s: profile.md absent at %s; skipping soul sync",
+                    cfg.id, profile_path,
+                )
+                soul_text = None
+            if soul_text is not None:
+                await sync_agent_profile(cfg, {"soul": soul_text})
+                logger.debug("migrate %s: soul synced (%d chars)", cfg.id, len(soul_text))
+        except HttpError as exc:
+            logger.warning(
+                "migrate %s: soul sync rejected (HTTP %s); machine_id "
+                "landed so the agent is reachable but soul may render empty",
+                cfg.id, exc.status,
+            )
+        except OSError as exc:
+            logger.warning(
+                "migrate %s: soul read failed (%s); skipping soul sync",
+                cfg.id, exc,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort; other agents proceed
+            logger.warning("migrate %s: soul sync failed: %s", cfg.id, exc)
         finally:
             await http.close()
     return reported
