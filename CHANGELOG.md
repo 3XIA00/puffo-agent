@@ -4,6 +4,21 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- **Archive and delete revoke the agent's device server-side.**
+  Previously the device cert stayed valid forever, so restoring an
+  archived dir resurrected the agent. The archive / delete paths
+  (HTTP API, control WS, CLI) now POST `/devices/<id>/revoke` after
+  moving the dir to `archived/<id>-*-<stamp>/`. Revoke is best-
+  effort: transient failure leaves a `pending_revoke.json` marker
+  that the daemon's startup sweep retries; delete falls back to
+  archive on revoke failure so the keys for retry survive. Recovery
+  needs re-signing a new device cert against the enrollment
+  endpoint with the on-disk root + device_signing keys.
+
 ## [1.0.5] — 2026-06-30
 
 ### Added

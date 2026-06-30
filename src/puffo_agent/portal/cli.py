@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from .api.pairing import clear_pairing, load_pairing
 from .daemon import run_daemon
@@ -1086,6 +1087,10 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
     agent_id = args.id
     src = agent_dir(agent_id)
     if not src.exists():
+        from .control.client import _is_already_archived
+        if _is_already_archived(agent_id):
+            print(f"{agent_id!r} is already archived")
+            return 0
         print(f"error: agent {agent_id!r} not found", file=sys.stderr)
         return 2
     # Pause first so the worker exits cleanly before we move the dir.
@@ -1103,29 +1108,55 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
     archived_dir().mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     dest = archived_dir() / f"{agent_id}-{stamp}"
-    # Retry briefly: aiosqlite WAL handles can take a moment to
-    # release after client.stop() returns on Windows.
-    last_err: OSError | None = None
-    for attempt in range(8):
-        try:
-            shutil.move(str(src), str(dest))
-            last_err = None
-            break
-        except (OSError, PermissionError) as exc:
-            last_err = exc
-            time.sleep(0.5)
-    if last_err is not None:
-        # Surface a clear error so the operator can clean up by hand.
-        print(
-            f"error: archive partially failed after retries: {last_err}\n"
-            f"       source: {src}\n"
-            f"       dest:   {dest}\n"
-            "       inspect both dirs and remove the source by hand if dest looks complete.",
-            file=sys.stderr,
-        )
-        return 1
-    print(f"archived {agent_id!r} → {dest}")
-    return 0
+    from .daemon import _retry_move
+    from .import_agents import (
+        revoke_archived_device,
+        write_archived_pending_revoke,
+    )
+
+    async def _archive_async() -> int:
+        move_err = await _retry_move(src, dest)
+        if move_err is not None:
+            print(
+                f"error: archive move failed after retries: {move_err}\n"
+                f"       source: {src}\n"
+                f"       dest:   {dest}",
+                file=sys.stderr,
+            )
+            return 1
+        if cfg.puffo_core.is_configured():
+            try:
+                await revoke_archived_device(dest, slug=cfg.puffo_core.slug)
+                print(f"revoked {agent_id!r} device server-side")
+            except Exception as exc:  # noqa: BLE001
+                reason = f"{type(exc).__name__}: {exc}"
+                print(
+                    f"warning: device revoke failed ({reason}); pending "
+                    "marker left for the daemon's next startup sweep",
+                    file=sys.stderr,
+                )
+                try:
+                    from ..crypto.keystore import KeyStore
+                    identity = KeyStore(dest / "keys").load_identity(
+                        cfg.puffo_core.slug
+                    )
+                    write_archived_pending_revoke(
+                        dest,
+                        server_url=identity.server_url,
+                        slug=identity.slug,
+                        device_id=identity.device_id,
+                        last_error=reason,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"warning: failed to write pending_revoke marker "
+                        f"into {dest}: {exc}",
+                        file=sys.stderr,
+                    )
+        print(f"archived {agent_id!r} → {dest}")
+        return 0
+
+    return asyncio.run(_archive_async())
 
 
 def cmd_agent_edit(args: argparse.Namespace) -> int:

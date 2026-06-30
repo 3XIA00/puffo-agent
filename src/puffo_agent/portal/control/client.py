@@ -15,6 +15,7 @@ from ..state import (
     AgentConfig,
     agent_yml_path,
     archive_flag_path,
+    archived_dir,
     discover_agents,
     restart_flag_path,
 )
@@ -31,6 +32,18 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 # Control-WS heartbeat: liveness ping + capability re-check cadence. Must stay
 # well under the server's HEARTBEAT_TIMEOUT (90s) or the server culls us.
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+
+def _is_already_archived(agent_slug: str) -> bool:
+    # Matches any archived/<slug>-* suffix (-ws-/-del-/bare-stamp).
+    root = archived_dir()
+    if not root.exists():
+        return False
+    prefix = f"{agent_slug}-"
+    return any(
+        child.is_dir() and child.name.startswith(prefix)
+        for child in root.iterdir()
+    )
 
 
 def _touch_flag(path) -> None:
@@ -110,6 +123,13 @@ async def execute_command(
     pairing context)."""
     if op in ("pause", "resume", "edit", "archive", "refresh"):
         if not agent_slug or not agent_yml_path(agent_slug).exists():
+            # Re-archive of an already-archived agent is idempotent OK.
+            if op == "archive" and agent_slug and _is_already_archived(agent_slug):
+                return {
+                    "ok": True,
+                    "note": "already archived",
+                    "agent_slug": agent_slug,
+                }
             return {"ok": False, "error": f"unknown agent {agent_slug!r}"}
 
     if op == "pause":
