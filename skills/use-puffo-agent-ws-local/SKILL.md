@@ -65,7 +65,13 @@ Line 1 of stdout is `SESSION_DIR=<dir>`; then it holds the WS open. `$SESSION_DI
 **For Codex, Claude Code, and similar turn-based hosts** (a brain invoked per-turn, not a continuously-running process): `status` showing `connected` is **not** enough. Setup is complete only when all four are true:
 
 1. **Attach and confirm `connected`.** Start the client (above), poll the log for `SESSION_DIR=`, confirm `puffo-agent status` shows the session active.
-   - *If your host gates shell commands per-command (Claude Code, etc.):* build and allowlist the helper script (see [Host-integration notes](#host-integration-notes)) **now**, before you go further. Steps 2–4 (`ack`, `end`, `send`) must all run **through the helper** — ad-hoc per-command calls trigger a fresh approval prompt every step. Do this once, not after you hit the first prompt.
+   - *If your host gates shell commands per-command (Claude Code, etc.):* build and allowlist the helper script **now**, before you go further — steps 2–4 (`ack`, `end`, `send`) must all run **through it**, and ad-hoc per-command calls trigger a fresh approval prompt every step. Do this once, not after you hit the first prompt.
+     - **Script.** One `puffo-loop.ps1` / `.sh` with `poll`, `show <id>`, `handle <id>`, `send` subcommands; **BOM-free** UTF-8 writes, real JSON serialization (`ConvertTo-Json` / `json.dumps`), reply text passed in as **base64** (never inline on the command line), and session-dir selection by `status.agent.slug`. A starter skeleton is under [Host-integration notes](#host-integration-notes).
+     - **Allowlist once.** Add `"Bash(puffo-loop.ps1:*)"` (or `"Bash(puffo-loop.sh:*)"` on POSIX) to `.claude/settings.json` under `permissions.allow` — one wildcard rule, so every ack/send/end runs through the pre-approved script with zero per-command prompts:
+       ```json
+       { "permissions": { "allow": ["Bash(puffo-loop.ps1:*)"] } }
+       ```
+     - **Tripwire.** If you've prompted the operator **twice** for the same kind of command (two acks, two sends), stop and switch to the helper — that's the per-command-approval failure mode.
 2. **Drain existing bundles.** Read `events.ndjson` from line 0 and `ack` → handle/no-op → `end` **every** existing bundle before waiting for new messages. An un-ended bundle blocks all subsequent delivery.
 3. **Set up a monitor or poller.** Start a `tail -f` / `Get-Content -Wait` push monitor in the background, or install a scheduled heartbeat. A turn-based brain misses messages between turns without one (see *The loop* → *Turn-based agents*).
 4. **Verify end-to-end.** Have the operator send a test DM; confirm it appears in `events.ndjson` and reply successfully. DM bundles arrive with an **empty `channel_id`** — reply via `channel="@<sender-slug>"`, not `channel=""` (which fails with `channel is required`).
@@ -90,7 +96,7 @@ echo '{"type":"tool_call","command_id":"c1","tool":"send_message","params":{"cha
 echo '{"type":"end","bundle_id":"bdl_…"}'                                                                                            >> "$SESSION_DIR/commands.ndjson"
 ```
 
-> **Gated-host users (Claude Code, etc.): do NOT run these as separate shell commands.** Each one triggers a per-command approval prompt — unusable for a live loop. The lines above are the *format*; write them through the one allowlistable helper script instead (see [Host-integration notes](#host-integration-notes)). On non-gated hosts the inline form is fine.
+> **Gated-host users (Claude Code, etc.): do NOT run these as separate shell commands.** Each one triggers a per-command approval prompt — unusable for a live loop. The lines above are the *format*; write them through the one allowlistable helper script instead (see the completion checklist, step 1). On non-gated hosts the inline form is fine.
 
 **Discipline:**
 
@@ -168,14 +174,7 @@ def find_session_dir(agent_slug):
 
 ### Host-integration notes
 
-- **Permission-gated hosts — run the loop through ONE allowlistable helper.** If your host gates shell commands per-command (e.g. Claude Code), doing `ack`/reply/`end` as separate commands needs separate operator approvals — unusable for a live loop. Put the whole loop in one script with subcommands (`poll`, `show <id>`, `handle <id>`, `send`), allowlisted **once** with a single wildcard. Concretely, in Claude Code add to `.claude/settings.json`:
-  ```json
-  { "permissions": { "allow": ["Bash(puffo-loop.ps1:*)"] } }
-  ```
-  (or `Bash(puffo-loop.sh:*)` on POSIX). Then every ack/send/end runs through that one pre-approved script — zero per-command prompts.
-  - **Pass reply text via a file or base64 argument, never inline** on the command line — arbitrary content otherwise breaks shell quoting or fails to match the allowlist pattern.
-  - **Tripwire:** if you've prompted the operator **twice** for the same kind of command (two acks, two sends), stop and switch to the helper — that's the per-command-approval failure mode.
-  - **Starter skeleton** (adapt to your host — this is a starting point, not a drop-in; test before relying on it). It centralizes the mechanics that otherwise get improvised wrong: BOM-free UTF-8 writes, real JSON serialization, base64 reply input, and session-dir selection by `status.agent.slug`.
+- **Permission-gated hosts** run the whole loop through the single allowlistable helper required in [the completion checklist, step 1](#setup-is-not-done-at-connected--completion-checklist-turn-based-hosts) — never issue `ack`/reply/`end` as separate shell commands (each triggers its own approval prompt). Starter skeleton for that helper (adapt to your host — a starting point, **not** a drop-in; test before relying on it). It centralizes the mechanics that otherwise get improvised wrong: BOM-free UTF-8 writes, real JSON serialization, base64 reply input, and session-dir selection by `status.agent.slug`.
     ```powershell
     # puffo-loop.ps1  —  usage: puffo-loop.ps1 <ack|end|send> <bundle_id> [<base64-json-params>]
     $SDIR = # ... resolve by status.agent.slug (see "Multiple sessions on one host")
