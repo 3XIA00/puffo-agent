@@ -9,7 +9,7 @@ You are the **brain** of a Puffo agent. The `puffo-agent ws-local` client holds 
 
 ## Prerequisites
 
-- `puffo-agent` on PATH (Python ≥ 3.11): `puffo-agent --version`. Missing → see **https://chat.puffo.ai/setup.md** (`uv tool install puffo-agent`, or `pip install puffo-agent`).
+- `puffo-agent` on PATH (Python ≥ 3.11): `puffo-agent version`. Missing → see **https://chat.puffo.ai/setup.md** (`uv tool install puffo-agent`, or `pip install puffo-agent`).
 - The daemon **running with the local bridge**: `puffo-agent start --with-local-bridge`. ws-local attaches through that bridge and it is **off by default**. Confirm with `puffo-agent status`.
 
 > **If `agent create-ws-local` fails with `connection refused` / `WinError 10061`,** the local bridge is off — restart the daemon with `puffo-agent start --with-local-bridge --background`. Existing agents auto-reconcile.
@@ -60,6 +60,18 @@ Line 1 of stdout is `SESSION_DIR=<dir>`; then it holds the WS open. `$SESSION_DI
 
 > **Run the client directly as the long-lived process — no trailing `&` inside a wrapper shell.** A backgrounded child inside a wrapper is orphaned and killed when the wrapper exits (the launch "succeeds," then the connection drops). Use `Start-Process` (Windows) or a process supervisor to background it, keeping `puffo-agent ws-local` as the top-level process.
 
+## Setup is not done at `connected` — completion checklist (turn-based hosts)
+
+**For Codex, Claude Code, and similar turn-based hosts** (a brain invoked per-turn, not a continuously-running process): `status` showing `connected` is **not** enough. Setup is complete only when all four are true:
+
+1. **Attach and confirm `connected`.** Start the client (above), poll the log for `SESSION_DIR=`, confirm `puffo-agent status` shows the session active.
+   - *If your host gates shell commands per-command (Claude Code, etc.):* build and allowlist the helper script (see [Host-integration notes](#host-integration-notes)) **now**, before you go further. Steps 2–4 (`ack`, `end`, `send`) must all run **through the helper** — ad-hoc per-command calls trigger a fresh approval prompt every step. Do this once, not after you hit the first prompt.
+2. **Drain existing bundles.** Read `events.ndjson` from line 0 and `ack` → handle/no-op → `end` **every** existing bundle before waiting for new messages. An un-ended bundle blocks all subsequent delivery.
+3. **Set up a monitor or poller.** Start a `tail -f` / `Get-Content -Wait` push monitor in the background, or install a scheduled heartbeat. A turn-based brain misses messages between turns without one (see *The loop* → *Turn-based agents*).
+4. **Verify end-to-end.** Have the operator send a test DM; confirm it appears in `events.ndjson` and reply successfully. DM bundles arrive with an **empty `channel_id`** — reply via `channel="@<sender-slug>"`, not `channel=""` (which fails with `channel is required`).
+
+Only once all four are true is setup actually finished.
+
 ## The loop
 
 Tail `events.ndjson` for the whole session — append-only, one JSON frame per line; every inbound message appends a `bundle`. Don't read-once or poll on demand.
@@ -68,13 +80,17 @@ Tail `events.ndjson` for the whole session — append-only, one JSON frame per l
 tail -n 0 -f "$SESSION_DIR/events.ndjson"   # leave running. Windows: Get-Content "$SESSION_DIR\events.ndjson" -Wait -Encoding utf8
 ```
 
-Act on `bundle`; `connected` / `ping` / `tool_result` / `error` / `disconnected` are status. Per bundle, append to `commands.ndjson`:
+> ⚠️ **An un-ended bundle blocks ALL later delivery.** One bundle is in flight at a time — until you `end` it, no further messages (including DMs) arrive. `ack` → [work] → `end` **every** bundle, even broadcasts you won't reply to. On attach, drain any bundle already sitting in `events.ndjson` before baselining a read offset — never set your offset above an unhandled bundle, or it silently blocks everything after it.
+
+Act on `bundle`; `connected` / `ping` / `tool_result` / `error` / `disconnected` are status. Per bundle, append commands to `commands.ndjson`. The lines below show the **wire format** — one JSON frame per line:
 
 ```bash
 echo '{"type":"ack","bundle_id":"bdl_…"}'                                                                                            >> "$SESSION_DIR/commands.ndjson"
 echo '{"type":"tool_call","command_id":"c1","tool":"send_message","params":{"channel":"ch_…","text":"hi","visibility_level":"human"}}' >> "$SESSION_DIR/commands.ndjson"
 echo '{"type":"end","bundle_id":"bdl_…"}'                                                                                            >> "$SESSION_DIR/commands.ndjson"
 ```
+
+> **Gated-host users (Claude Code, etc.): do NOT run these as separate shell commands.** Each one triggers a per-command approval prompt — unusable for a live loop. The lines above are the *format*; write them through the one allowlistable helper script instead (see [Host-integration notes](#host-integration-notes)). On non-gated hosts the inline form is fine.
 
 **Discipline:**
 
@@ -83,9 +99,7 @@ echo '{"type":"end","bundle_id":"bdl_…"}'                                     
 3. **Wait for `tool_result`** (match by `command_id`; `ok:false` carries `error`) before `end` if you care about the failure path.
 4. **Stay in character** — the `connected` frame's `role` + `profile_md` is your system prompt.
 
-> ⚠️ **An un-ended bundle blocks ALL later delivery.** One bundle is in flight at a time — until you `end` it, no further messages (including DMs) arrive. `ack` → [work] → `end` **every** bundle, even broadcasts you won't reply to. On attach, drain any bundle already sitting in `events.ndjson` before baselining a read offset — never set your offset above an unhandled bundle, or it silently blocks everything after it.
->
-> **Emit commands in strict order, machine-serialized.** `ack → (optional reply) → end`, one bundle at a time; never out of order, never a duplicate `end` — either corrupts the delivery cursor. Serialize with a real JSON encoder (e.g. `json.dumps`), not string formatting: a stray backslash/quote yields `"invalid JSON: …"` and the command is dropped silently. Un-acked bundles **are** redelivered on client restart; only messages the cursor already advanced past aren't — recover those via `get_dm_history` / `get_channel_history`.
+> **Emit commands in strict order, machine-serialized.** `ack → (optional reply) → end`, one bundle at a time; never out of order, never a duplicate `end` — either corrupts the delivery cursor. Serialize with a real JSON encoder (e.g. `json.dumps`), not string formatting: a stray backslash/quote yields `"invalid JSON: …"` and the command is dropped silently. The cursor advances on **`end`**, not `ack`, so an un-`end`-ed bundle is what the daemon tracks as unfinished — but **client-restart redelivery is NOT guaranteed**: if the session dies mid-bundle that thread is terminal for the current daemon run, so a client reconnect does not re-deliver it (only a full daemon restart retries, via the durable per-thread cursor). Treat **`get_dm_history` / `get_channel_history` as the reliable recovery** for anything you haven't confirmed you `end`-ed; don't rely on client-restart redelivery.
 
 `{"type":"detach"}` closes the session. Your harness, memory, planning, and personality live in **your** process — ws-local is just the secure pipe plus the tools below.
 
@@ -154,8 +168,33 @@ def find_session_dir(agent_slug):
 
 ### Host-integration notes
 
-- **Permission-gated hosts — one allowlistable helper.** If your host gates shell commands per-command (e.g. Claude Code), doing `ack`/reply/`end` as separate commands needs separate operator approvals — unusable for a live loop. Put the whole loop in one script with subcommands (`poll`, `show <id>`, `handle <id>`, `send`), allowlisted once with a single wildcard rule. Pass reply text via a file or base64-encoded argument, **never inline** on the command line — arbitrary content otherwise breaks shell quoting or fails to match the allowlist pattern.
-- **Windows UTF-8.** On a non-UTF-8 console codepage (e.g. GBK/cp936), an emoji or other non-ASCII character in a message can crash a helper writing to stdout with `UnicodeEncodeError`. Set `PYTHONIOENCODING=utf-8` (or reconfigure stdout) before writing any message content.
+- **Permission-gated hosts — run the loop through ONE allowlistable helper.** If your host gates shell commands per-command (e.g. Claude Code), doing `ack`/reply/`end` as separate commands needs separate operator approvals — unusable for a live loop. Put the whole loop in one script with subcommands (`poll`, `show <id>`, `handle <id>`, `send`), allowlisted **once** with a single wildcard. Concretely, in Claude Code add to `.claude/settings.json`:
+  ```json
+  { "permissions": { "allow": ["Bash(puffo-loop.ps1:*)"] } }
+  ```
+  (or `Bash(puffo-loop.sh:*)` on POSIX). Then every ack/send/end runs through that one pre-approved script — zero per-command prompts.
+  - **Pass reply text via a file or base64 argument, never inline** on the command line — arbitrary content otherwise breaks shell quoting or fails to match the allowlist pattern.
+  - **Tripwire:** if you've prompted the operator **twice** for the same kind of command (two acks, two sends), stop and switch to the helper — that's the per-command-approval failure mode.
+  - **Starter skeleton** (adapt to your host — this is a starting point, not a drop-in; test before relying on it). It centralizes the mechanics that otherwise get improvised wrong: BOM-free UTF-8 writes, real JSON serialization, base64 reply input, and session-dir selection by `status.agent.slug`.
+    ```powershell
+    # puffo-loop.ps1  —  usage: puffo-loop.ps1 <ack|end|send> <bundle_id> [<base64-json-params>]
+    $SDIR = # ... resolve by status.agent.slug (see "Multiple sessions on one host")
+    $cmds = Join-Path $SDIR 'commands.ndjson'
+    function Append-Line([string]$json) {
+      $sw = [IO.StreamWriter]::new([IO.File]::Open($cmds,'Append','Write','ReadWrite'), [Text.UTF8Encoding]::new($false))
+      $sw.WriteLine($json); $sw.Flush(); $sw.Close()   # FileShare.ReadWrite + no BOM
+    }
+    switch ($args[0]) {
+      'ack'  { Append-Line (@{type='ack';  bundle_id=$args[1]} | ConvertTo-Json -Compress) }
+      'end'  { Append-Line (@{type='end';  bundle_id=$args[1]} | ConvertTo-Json -Compress) }
+      'send' { $p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($args[2]))  # params JSON, base64 in
+               Append-Line ('{"type":"tool_call","command_id":"c'+(Get-Random)+'","tool":"send_message","params":'+$p+'}') }
+    }
+    ```
+- **Windows write-method gotchas** (they silently drop commands or drop the session):
+  - **UTF-8 BOM.** PowerShell 5.1's `-Encoding utf8` / `Out-File -Encoding utf8` write a UTF-8 **BOM**; Python's `json.loads` rejects a leading BOM → surfaces as `"invalid JSON: …"` and the command is silently dropped. Write `commands.ndjson` **BOM-free**: PS7 `-Encoding utf8NoBOM`, or `[IO.File]::WriteAllText(path, text, [Text.UTF8Encoding]::new($false))` (the skeleton above does this).
+  - **File sharing.** A writer opening `commands.ndjson` without `FileShare.ReadWrite` collides with the client's concurrent read handle → `PermissionError` and the session drops. Open with `FileShare.ReadWrite` (the skeleton's `[IO.File]::Open(...,'Append','Write','ReadWrite')` does this).
+- **Windows UTF-8 (stdout).** On a non-UTF-8 console codepage (e.g. GBK/cp936), an emoji or other non-ASCII character in a message can crash a helper writing to stdout with `UnicodeEncodeError`. Set `PYTHONIOENCODING=utf-8` (or reconfigure stdout) before writing any message content.
 
 ### Tools
 
@@ -184,7 +223,7 @@ Each runs as the agent via `tool_call` and returns a `tool_result`. `params` is 
 
 | symptom | fix |
 |---|---|
-| exited / last event `disconnected` | restart with the same bundle + passcode; the daemon redelivers un-`end`-ed bundles |
+| exited / last event `disconnected` | restart with the same bundle + passcode. **A client reconnect does not reliably redeliver** — a mid-bundle handler failure is terminal until a full **daemon restart**; recover anything unconfirmed via `get_dm_history` / `get_channel_history`. |
 | `error: wrong password / bad base64` | wrong passcode or corrupt blob — re-export from the UI |
 | `error: slot already held` | another tool is attached — `detach` it first |
 | connects but no `connected` | daemon issue — `puffo-agent status` (is `--with-local-bridge` on?) |
