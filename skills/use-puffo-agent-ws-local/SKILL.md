@@ -64,7 +64,7 @@ Line 1 of stdout is `SESSION_DIR=<dir>`; then it holds the WS open. `$SESSION_DI
 
 1. **Attach and confirm `connected`.** Start the client (above), poll the log for `SESSION_DIR=`, confirm `puffo-agent status` shows the session active.
    - *If your host gates shell commands per-command (Claude Code, etc.):* build and allowlist the helper script **now**, before you go further — steps 2–4 (`ack`, `end`, `send`) must all run **through it**, and ad-hoc per-command calls trigger a fresh approval prompt every step. Do this once, not after you hit the first prompt.
-     - **Script.** One `puffo-loop.ps1` / `.sh` with `poll`, `show <id>`, `handle <id>`, `send` subcommands; **BOM-free** UTF-8 writes, real JSON serialization (`ConvertTo-Json` / `json.dumps`), reply text passed in as **base64** (never inline on the command line), and session-dir selection by `status.agent.slug`. A starter skeleton is under [Host-integration notes](#host-integration-notes).
+     - **Script.** One `puffo-loop.ps1` / `.sh` with `poll`, `show <id>`, `handle <id>`, `send` subcommands; **BOM-free** UTF-8 writes, real JSON serialization (`ConvertTo-Json` / `json.dumps`), reply text passed in as **base64** (never inline on the command line), and session-dir selection by `status.agent.slug`. A starter skeleton (the `ack`/`end`/`send` write-primitive core these subcommands build on) is under [Host-integration notes](#host-integration-notes).
      - **Allowlist once.** Add `"Bash(puffo-loop.ps1:*)"` (or `"Bash(puffo-loop.sh:*)"` on POSIX) to `.claude/settings.json` under `permissions.allow` — one wildcard rule, so every ack/send/end runs through the pre-approved script with zero per-command prompts:
        ```json
        { "permissions": { "allow": ["Bash(puffo-loop.ps1:*)"] } }
@@ -178,9 +178,11 @@ def find_session_dir(agent_slug, temp_dir):
 
 ### Host-integration notes
 
-- **Permission-gated hosts** run the whole loop through the single allowlistable helper required in [the completion checklist, step 1](#setup-is-not-done-at-connected--completion-checklist-turn-based-hosts) — never issue `ack`/reply/`end` as separate shell commands (each triggers its own approval prompt). Starter skeleton for that helper (adapt to your host — a starting point, **not** a drop-in; test before relying on it). It centralizes the mechanics that otherwise get improvised wrong: BOM-free UTF-8 writes, real JSON serialization, base64 reply input, and session-dir selection by `status.agent.slug`.
+- **Permission-gated hosts** run the whole loop through the single allowlistable helper required in [the completion checklist, step 1](#setup-is-not-done-at-connected--completion-checklist-turn-based-hosts) — never issue `ack`/reply/`end` as separate shell commands (each triggers its own approval prompt). The skeleton below is the **write-primitive core** of that helper — the low-level `ack` / `end` / `send` frame-writing that step 1's fuller `poll` / `show <id>` / `handle <id>` subcommands build on (poll reads new `events.ndjson` frames; handle = `ack` → work → reply → `end`). It's a starting point, **not** a drop-in — test before relying on it. It centralizes the mechanics that otherwise get improvised wrong: BOM-free UTF-8 writes, real JSON serialization, base64 reply input, and session-dir selection by `status.agent.slug`.
     ```powershell
-    # puffo-loop.ps1  —  usage: puffo-loop.ps1 <ack|end|send> <bundle_id> [<base64-json-params>]
+    # puffo-loop.ps1 — write-primitive core (ack/end/send). Step 1's poll/show/handle
+    #   subcommands read events.ndjson and dispatch to these.
+    # usage: puffo-loop.ps1 <ack|end|send> <bundle_id> [<base64-json-params>]
     $SDIR = # ... resolve by status.agent.slug — see find_session_dir under "Multiple sessions on one host"
     $cmds = Join-Path $SDIR 'commands.ndjson'
     function Append-Line([string]$json) {
