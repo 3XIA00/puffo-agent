@@ -142,11 +142,25 @@ Two ways to close the gap:
 >
 > When you install the unattended cron job, kill the interactive push-monitor. The cron job is the only handler. Do not run both.
 
+> **Windows: scheduling the unattended poller.** Use `schtasks /Create`:
+>
+> ```
+> schtasks /Create /TN "PuffoAgent-<slug>" /TR "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File <path-to-poller.ps1>" /SC MINUTE /MO 2 /F
+> ```
+>
+> Do **not** pass `/RL HIGHEST` — it requires elevation and fails with Access Denied at a standard user level. Do **not** use `Register-ScheduledTask` with `RepetitionDuration = [TimeSpan]::MaxValue` — it is rejected as out of range. The `schtasks` indefinite default (no `/D` or `/ET`) runs the task on the specified cadence without a duration limit.
+>
+> **Credential hygiene:** your poller script and state dir inevitably hold the bundle path + passcode (an unattended relaunch can't prompt for them). Restrict that directory — Windows: ACL to your user only; POSIX: `chmod 700` — same as the session work-dir.
+
 ### Running unattended — memory, supervision, models
 
-- **Memory lives in your process/session.** Drive replies from ephemeral/isolated workers (e.g. a fresh cron invocation per message) and each reply is stateless — the agent has no prior-conversation context ("I have no context from a prior session"). A conversational agent must run all replies in one persistent session.
+- **Memory lives in your process/session.** Drive replies from ephemeral/isolated workers (e.g. a fresh cron invocation per message) and each reply is stateless — the agent has no prior-conversation context ("I have no context from a prior session"). A conversational agent must run replies in a persistent session — one per conversation, see below.
 - **The client is not supervised.** It can emit `{"type":"disconnected"}` and stay down with nothing to restart it — the agent goes dark silently. For unattended reliability, run a watchdog that (1) detects a dead/disconnected session (last event `disconnected`, or the process is gone), (2) relaunches against the same bundle, and (3) keeps exactly ONE client per agent — a second client for the same agent steals the slot and disconnects the first.
 - **Model allowlist.** The agent model picker is limited to opus and sonnet variants (haiku is blocked); this applies generally, including cron/scheduler turns. Use `sonnet-4-6` for low-cost watcher invocations where no real message is present.
+
+> **Per-conversation memory (turn-based brains that support session persistence).** A single global session (one id for all conversations) restores memory but cross-contaminates unrelated chats. A fresh session per message has no memory at all. The right balance: one persistent session **per conversation**, keyed by DM peer slug or channel-thread root id, stored in a small map file (e.g., `brain-sessions.json`). On each cron tick: look up the conversation key, reuse the existing session id if found, start a new one if not. Concrete session flags are host-specific — consult your brain's documentation — but the map structure is the same regardless of host.
+>
+> **Scope caveat for coordinating agents.** This pattern gives each conversation its own reply memory; it does not carry a task or goal across different conversations. A coordinating agent that's assigned work in one conversation and must act in another needs durable state it can read from any session — a task list, log, or memory file — not session memory, which is both isolated per-conversation and volatile across restarts. Durable state only helps if the poller injects it into every tick's context; a task file no session reads is dead weight.
 
 > **Design the reply path for the unattended context before you start.** Some hosts (Hermes included) block `execute_code` and `python -c` in unattended cron sessions. Verify which primitives your host allows unattended; don't assume interactive behavior carries over. Every operation in the ack→compose→send→end chain must use only the toolsets your cron job is granted — typically `terminal` (for the control script) and `file` (for `write_file`). The recommended pattern: compose reply text to a plain UTF-8 file with `write_file`, then call your helper's `replyfile <bundle_id> <path>` subcommand to send. No base64 encoding, no shell quoting, no blocked tools.
 >
@@ -218,6 +232,18 @@ def find_session_dir(agent_slug, temp_dir):
   - **UTF-8 BOM.** PowerShell 5.1's `-Encoding utf8` / `Out-File -Encoding utf8` write a UTF-8 **BOM**; Python's `json.loads` rejects a leading BOM → surfaces as `"invalid JSON: …"` and the command is silently dropped. Write `commands.ndjson` **BOM-free**: PS7 `-Encoding utf8NoBOM`, or `[IO.File]::WriteAllText(path, text, [Text.UTF8Encoding]::new($false))` (the skeleton above does this).
   - **File sharing.** A writer opening `commands.ndjson` without `FileShare.ReadWrite` collides with the client's concurrent read handle → `PermissionError` and the session drops. Open with `FileShare.ReadWrite` (the skeleton's `[IO.File]::Open(...,'Append','Write','ReadWrite')` does this).
 - **Windows UTF-8 (stdout).** On a non-UTF-8 console codepage (e.g. GBK/cp936), an emoji or other non-ASCII character in a message can crash a helper writing to stdout with `UnicodeEncodeError`. Set `PYTHONIOENCODING=utf-8` (or reconfigure stdout) before writing any message content.
+
+> **Windows PowerShell: native-process output handling (three gotchas).** When your cron script captures a native brain CLI's output, PS 5.1 introduces three compounding problems:
+>
+> **(a) Console codepage misdecode — sharpest.** In a scheduled task's fresh console, `[Console]::OutputEncoding` defaults to the system codepage (e.g. cp936/GBK). If the brain emits UTF-8, every non-ASCII character is silently corrupted before your write helper sees it — the reply reaches the wire and looks "sent," but the operator sees garbled text.
+> Fix: set `[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)` before capturing native brain output. Alternatively, write the brain's reply to a UTF-8 file from inside the brain and read it back with explicit encoding — this bypasses the console decode entirely.
+>
+> **(b) stderr-as-fatal.** `$ErrorActionPreference = 'Stop'` promotes native stderr to a terminating error **when the stream is captured or redirected** — which output-capturing helpers and scheduled-task contexts typically do. If the brain CLI writes a banner or ANSI codes to stderr, the script throws before capturing the reply, and the error text may be an invisible control character.
+> Fix: scope `$ErrorActionPreference = 'Continue'` around the brain invocation and suppress stderr with `2>$null`.
+>
+> **(c) Noisy stdout.** Assume native brain CLI stdout contains banners, model headers, and ANSI formatting before the reply payload. Filter explicitly (e.g., exclude lines starting with `>`; strip ANSI codes; extract `"type":"text"` parts from JSON output). Prefer the brain's machine-readable output mode where one exists.
+>
+> These apply to any brain invoked as a native process in a PS 5.1 cron context — not just opencode.
 
 ### Tools
 
