@@ -214,15 +214,15 @@ def _parse_operator_pubkey(identity_cert_json: Optional[str]) -> Optional[bytes]
     return op_pk
 
 
-def _compute_priority(direct: bool, sender_is_bot: bool) -> int:
-    """Map (direct, sender_is_bot) to one of the PRIORITY_* bands.
+def _compute_priority(direct: bool, sender_is_agent: bool) -> int:
+    """Map (direct, sender_is_agent) to one of the PRIORITY_* bands.
     PRIORITY_SYSTEM is reserved for a future service-message envelope.
     """
-    if direct and not sender_is_bot:
+    if direct and not sender_is_agent:
         return PRIORITY_MENTIONED_HUMAN
-    if direct and sender_is_bot:
+    if direct and sender_is_agent:
         return PRIORITY_MENTIONED_BOT
-    if not sender_is_bot:
+    if not sender_is_agent:
         return PRIORITY_HUMAN
     return PRIORITY_BOT
 
@@ -505,6 +505,11 @@ class PuffoCoreMessageClient:
         # under the same TTL — transient lookup failures self-heal at
         # the next tick instead of pinning a permanent "" miss.
         self._profile_cache: dict[str, tuple[str, str, float]] = {}
+        # slug → (owner_slug, fetched_at_monotonic). Populated by the
+        # same ``/identities/profiles`` call as ``_profile_cache``; empty
+        # for humans, the operator for agents. Same TTL so re-ownership
+        # propagates without a daemon restart.
+        self._owner_slug_cache: dict[str, tuple[str, float]] = {}
         # Invitation event_ids the worker has already processed.
         # Lifetime-scoped — the operator-DM branch isn't idempotent
         # against server-side state, so resetting on reconnect would
@@ -781,12 +786,12 @@ class PuffoCoreMessageClient:
             mentions: list[dict] = []
             for slug in parsed:
                 if slug == self_slug_lower:
-                    mentions.append({"username": self.slug, "is_bot": True, "is_self": True})
+                    mentions.append({"username": self.slug, "is_agent": True, "is_self": True})
                     continue
                 if space_members and slug not in space_members:
                     continue
-                is_bot = space_members.get(slug) == "agent"
-                mentions.append({"username": slug, "is_bot": is_bot, "is_self": False})
+                is_agent = space_members.get(slug) == "agent"
+                mentions.append({"username": slug, "is_agent": is_agent, "is_self": False})
 
             # Self-mention rewrite: `@<our-slug>` → `@you(<our-slug>)`
             # (the documented "addressed to you" signal).
@@ -809,10 +814,6 @@ class PuffoCoreMessageClient:
                 )
             else:
                 channel_name = channel_id
-
-            direct = is_dm or is_mention
-            sender_is_bot = False  # puffo-core has no is_bot flag yet
-            priority = _compute_priority(direct, sender_is_bot)
 
             # Thread-batched queue: every message coalesces under
             # its ``root_id`` (the envelope's ``thread_root_id``, or
@@ -849,6 +850,20 @@ class PuffoCoreMessageClient:
             sender_display_name = await self._fetch_display_name(
                 payload.sender_slug,
             )
+            # Cache-hit off ``_fetch_display_name`` above — no extra HTTP.
+            sender_owner_slug = await self._fetch_owner_slug(
+                payload.sender_slug,
+            )
+            is_from_operator = bool(
+                self.operator_slug
+                and payload.sender_slug == self.operator_slug
+            )
+
+            # ``owner_slug`` is agent-only — the is-agent signal the
+            # priority bands were designed around.
+            direct = is_dm or is_mention
+            sender_is_agent = bool(sender_owner_slug)
+            priority = _compute_priority(direct, sender_is_agent)
 
             # Long-message redaction. Operators paste big chunks of
             # code or transcripts that, combined with the agent's
@@ -875,12 +890,14 @@ class PuffoCoreMessageClient:
                 "space_name": space_name,
                 "sender_slug": payload.sender_slug,
                 "sender_display_name": sender_display_name,
+                "sender_owner_slug": sender_owner_slug,
+                "is_from_operator": is_from_operator,
                 "sender_email": "",
                 "text": llm_text,
                 "root_id": payload_thread_root_id or "",
                 "is_dm": is_dm,
                 "attachments": attachment_paths,
-                "sender_is_bot": sender_is_bot,
+                "sender_is_agent": sender_is_agent,
                 "mentions": mentions,
                 "envelope_id": payload.envelope_id,
                 "sent_at": payload.sent_at,
@@ -2085,6 +2102,20 @@ class PuffoCoreMessageClient:
         name, _ = await self._fetch_user_profile(slug)
         return name
 
+    async def _fetch_owner_slug(self, slug: str) -> str:
+        """Sender's operator slug (agents only; ``""`` for humans /
+        revoked attestation). Inbound path resolves the display_name
+        just before this so the TTL'd cache is warm — no extra HTTP."""
+        if not slug:
+            return ""
+        now = time.monotonic()
+        cached = self._owner_slug_cache.get(slug)
+        if cached is not None and now - cached[1] < _PROFILE_CACHE_TTL_SECONDS:
+            return cached[0]
+        await self._fetch_user_profile(slug, force_refresh=True)
+        fresh = self._owner_slug_cache.get(slug)
+        return fresh[0] if fresh else ""
+
     def set_profile(self, slug: str, display_name: str, avatar_url: str) -> None:
         """Inject fresh values into the profile cache, bypassing TTL.
         Used by the MCP ``get_user_info`` tool to share its just-
@@ -2116,6 +2147,7 @@ class PuffoCoreMessageClient:
                 return (cached[0], cached[1])
         name = ""
         avatar_url = ""
+        owner_slug = ""
         try:
             data = await self.http.get(
                 f"/identities/profiles?slugs={slug}",
@@ -2124,6 +2156,8 @@ class PuffoCoreMessageClient:
                 if entry.get("slug") == slug:
                     name = (entry.get("display_name") or "").strip()
                     avatar_url = (entry.get("avatar_url") or "").strip()
+                    # Non-empty only for agents (their operator).
+                    owner_slug = (entry.get("owner_slug") or "").strip()
                     break
         except Exception as exc:
             self._log.debug(
@@ -2131,6 +2165,7 @@ class PuffoCoreMessageClient:
                 slug, exc,
             )
         self._profile_cache[slug] = (name, avatar_url, now)
+        self._owner_slug_cache[slug] = (owner_slug, now)
         disk_cache.persist_profile(slug, name, avatar_url)
         if avatar_url:
             asyncio.create_task(self._fetch_and_cache_avatar(avatar_url))
@@ -2610,7 +2645,7 @@ class PuffoCoreMessageClient:
             "root_id": "",
             "is_dm": False,
             "attachments": [],
-            "sender_is_bot": False,
+            "sender_is_agent": False,
             "mentions": [],
             "envelope_id": envelope_id,
             "sent_at": now_ms,
@@ -2950,7 +2985,7 @@ class PuffoCoreMessageClient:
             "root_id": "",
             "is_dm": False,
             "attachments": [],
-            "sender_is_bot": False,
+            "sender_is_agent": False,
             "mentions": [],
             "envelope_id": envelope_id,
             "sent_at": now_ms,

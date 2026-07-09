@@ -6,6 +6,101 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Runbook for Codex Apps connector scope failures.** The `use-host-mcp`
+  skill body now explains that Codex Apps connectors (`mcp__codex_apps__*`
+  — Drive, Gmail, …) are codex-internal, not puffo-managed MCP, so
+  `list_mcp_servers` can't see them and `sync_host_mcp` can't fix them.
+  When writes fail with `ACCESS_TOKEN_SCOPE_INSUFFICIENT`, the fix is to
+  reconnect the connector in interactive codex (approving write scopes),
+  then `refresh(host_sync=True)` on the agent (`session=True` too on
+  cli-docker) and allow one worker turn. Docs only — no code path change.
+
+### Removed
+
+- **`SETUP_FOR_AI.md`.** The standalone AI-assistant onboarding guide was
+  last meaningfully updated at 0.9.4, had drifted from the current setup
+  flow, was referenced by nothing, and was never packaged. The living
+  onboarding pointer is the hosted `https://chat.puffo.ai/setup.md` plus
+  the in-agent skills.
+
+## [1.1.0] — 2026-07-08
+
+### Added
+
+- **Sender-identity metadata on inbound messages.** Two new fields land
+  in the structured user-block agents see: `sender_owner_slug` names
+  the operator behind an agent sender (present only for agents, sourced
+  from the attestation chain via `/identities/profiles`), and
+  `is_from_operator: true` marks a message from THIS agent's own
+  operator. Both emit conditionally so older agents don't see keys
+  their primer doesn't document. Zero extra HTTP round-trips: the
+  daemon reads `owner_slug` off the same `/identities/profiles` fetch
+  that resolves the sender's display name, caches it under the profile
+  TTL so re-ownership propagates without a daemon restart. Primer
+  documents both. `sender_type` now reads `agent` (was always
+  `human` — the upstream is-bot flag is unset pending a server-side
+  signal, but `owner_slug`'s presence is already a reliable agent
+  marker); the display value is renamed `bot` → `agent` to match the
+  `(agent)` mention suffix.
+
+### Changed
+
+- **Priority bands now receive the real is-agent signal.** The
+  message-queue priority computation had `sender_is_bot` hardcoded
+  `False` (puffo-core exposes no is-bot flag), so every sender landed
+  in the human bands and the agent bands were dead code. `owner_slug`
+  (agent-only, already fetched per sender) now drives the banding:
+  human traffic outranks agent traffic, mentions outrank both floors.
+  Behavior change in agent-dense fleets — an agent's DM/mention ranks
+  below a human's, and agent channel chatter yields to human channel
+  messages when both are queued. The flag is also renamed
+  `sender_is_bot` → `sender_is_agent` throughout, including the
+  message-dict key that rides ws-local bundles (the old key only ever
+  carried a hardcoded `false`, so no consumer could have relied on
+  its value). Mention entries follow suit: `is_bot` → `is_agent`
+  (same bundle surface; the rendered `(agent)` / `(human)` suffixes
+  are unchanged).
+
+- **Dead `followup_messages_since` removed from the primer + code.**
+  No code path has emitted the field since thread batching replaced
+  single-message dispatch, but the primer still documented it —
+  agents went looking for it and misreported batched messages as
+  message loss. The primer now documents the real shape (one turn
+  may carry several metadata blocks) and points agents at
+  `get_thread_history` / `get_channel_history` when mid-turn
+  freshness matters.
+
+### Fixed
+
+- **Multi-message batches reached CLI agents with only the last
+  message.** The thread-batched queue correctly coalesced same-root
+  messages that arrived while an agent was mid-turn, but the shell
+  appended each batch message as its own user log entry — and CLI
+  adapters transmit only the latest entry per turn (the resume-based
+  session already holds prior history), so every batched message
+  except the last was silently dropped before reaching the
+  subprocess, in DMs and channels alike. The whole batch now lands as
+  one user entry (per-message metadata blocks, blank-line separated),
+  fixing all CLI-family runtimes at the shell layer.
+
+## [1.0.8] — 2026-07-08
+
+### Added
+
+- **`puffo-agent machine link --code ABCD-1234`.** Claim a link code
+  the operator generated in the puffo web app (My Agents → Link
+  machine → *Generate code*) instead of minting one on this machine
+  and asking a browser to approve it. The machine registers itself
+  (idempotent) and POSTs `/v2/machines/links/<code>/redeem`; the
+  operator's client then issues the control cert, which the existing
+  approval poll picks up. Codes are case-insensitive and dashes are
+  optional — `abcd-2345`, `ABCD2345`, and `AB-CD-23-45` all normalize
+  to the same code. Without `--code` the mint-and-open-browser flow
+  is unchanged; the daemon still auto-starts. Requires puffo-server's
+  `/redeem` endpoint (paired server PR).
+
 ### Fixed
 
 - **Pre-turn stdout drain — no more cron chatter leaking into replies.**
