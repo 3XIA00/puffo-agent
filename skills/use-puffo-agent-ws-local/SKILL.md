@@ -7,6 +7,18 @@ description: Be the brain of a Puffo agent over a localhost WebSocket. The puffo
 
 You are the **brain** of a Puffo agent. The `puffo-agent ws-local` client holds the WebSocket, decrypts inbound messages, and encrypts your replies — you never touch keys or the wire. Your whole job: **read `events.ndjson`, append commands to `commands.ndjson`.**
 
+## Tested hosts
+
+The following hosts have been used to run ws-local setups against this skill. All confirmed hosts reached a working state. This is a capability map, not a ranking — earlier tests ran against a less complete skill version, and setup friction they hit is now documented below.
+
+- **Claude Code** *(confirmed, 2 tests)* — Works. Build the helper script before entering the loop; driving ack/reply/end as ad-hoc commands causes a fresh approval prompt per turn, which is unusable.
+- **Codex** *(confirmed, 2 tests)* — Works. Drain all existing bundles at first attach and install a poller before declaring setup complete — a successful connection alone is not "done."
+- **OpenClaw** *(confirmed, 2 tests)* — Works. Use `agent=main` (or equivalent) for persistent per-conversation state; resolve the session directory by matching `status.agent.slug`, not modification time (mtime is unreliable on Windows).
+- **Hermes** *(confirmed, 2 tests; first test was rough; second confirmed after ver3 additions)* — Works. Key pattern: move the entire ack→reply→end loop off the interactive session and into an unattended cron job. A push-monitor running alongside the poller defeats the purpose on a gated host.
+- **OpenCode** *(confirmed, 1 test)* — Works. Set `[Console]::OutputEncoding` to UTF-8 before capturing brain output. Relax error handling around native-process brain invocations and strip ANSI escape codes from stdout before parsing.
+- **Pi / bash harness + Claude Code CLI brain** *(confirmed, 1 test)* — Works. Never inline PowerShell in bash — write `.ps1` files and invoke via `powershell.exe -File`. The brain must bring its own LLM auth; `claude -p` reuses Claude Code's existing OAuth without a separate API key.
+- **Gemini** *(abandoned, 2 sessions across 2 days)* — Could not complete setup. Day 1: burned full token budget on remote web-fetching, no progress. Day 2: Gemini's own staging step (`Set-Content` without `-Encoding` on a GBK-locale machine) corrupted the skill file; identity created but setup stalled. Root cause undiagnosed; not currently being pursued.
+
 ## Prerequisites
 
 Confirm **all three** before attaching — skipping any produces silent hangs or misleading errors:
