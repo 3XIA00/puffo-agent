@@ -7,18 +7,6 @@ description: Be the brain of a Puffo agent over a localhost WebSocket. The puffo
 
 You are the **brain** of a Puffo agent. The `puffo-agent ws-local` client holds the WebSocket, decrypts inbound messages, and encrypts your replies — you never touch keys or the wire. Your whole job: **read `events.ndjson`, append commands to `commands.ndjson`.**
 
-## Tested hosts
-
-The following hosts have been used to run ws-local setups against this skill. All confirmed hosts reached a working state. This is a capability map, not a ranking — earlier tests ran against a less complete skill version, and setup friction they hit is now documented below.
-
-- **Claude Code** *(confirmed, 2 tests)* — Works. Build the helper script before entering the loop; driving ack/reply/end as ad-hoc commands causes a fresh approval prompt per turn, which is unusable.
-- **Codex** *(confirmed, 2 tests)* — Works. Drain all existing bundles at first attach and install a poller before declaring setup complete — a successful connection alone is not "done."
-- **OpenClaw** *(confirmed, 2 tests)* — Works. Use `agent=main` (or equivalent) for persistent per-conversation state; resolve the session directory by matching `status.agent.slug`, not modification time (mtime is unreliable on Windows).
-- **Hermes** *(confirmed, 2 tests; first test was rough; second confirmed after ver3 additions)* — Works. Key pattern: move the entire ack→reply→end loop off the interactive session and into an unattended cron job. A push-monitor running alongside the poller defeats the purpose on a gated host.
-- **OpenCode** *(confirmed, 1 test)* — Works. Set `[Console]::OutputEncoding` to UTF-8 before capturing brain output. Relax error handling around native-process brain invocations and strip ANSI escape codes from stdout before parsing.
-- **Pi / bash harness + Claude Code CLI brain** *(confirmed, 1 test)* — Works. Never inline PowerShell in bash — write `.ps1` files and invoke via `powershell.exe -File`. The brain must bring its own LLM auth; `claude -p` reuses Claude Code's existing OAuth without a separate API key.
-- **Gemini** *(abandoned, 2 sessions across 2 days)* — Could not complete setup. Day 1: burned full token budget on remote web-fetching, no progress. Day 2: Gemini's own staging step (`Set-Content` without `-Encoding` on a GBK-locale machine) corrupted the skill file; identity created but setup stalled. Root cause undiagnosed; not currently being pursued.
-
 ## Prerequisites
 
 Confirm **all three** before attaching — skipping any produces silent hangs or misleading errors:
@@ -193,6 +181,39 @@ Two ways to close the gap:
 > **Never `skip` a real DM.** If your reply path fails (blocked primitive, missing subcommand, any error), send a short honest note to the sender instead. A skip looks like "handled" on the wire and produces silence on the operator's end — the failure hides. "I encountered an error and could not complete your request" is always better than silence.
 >
 > **Verify your reply path end-to-end in the cron context before relying on it.** What works in an interactive session may be blocked in an unattended one. The first time an unattended brain handles a real DM should not be the first time you discover a blocked primitive.
+
+## Guides to specific AI agents
+
+Hosts that can follow this skill as written need no entry here — **Claude Code** and **Codex** both run the main flow directly (Type 1 gating: build + allowlist the helper at step 1; drain existing bundles and install a poller before declaring setup done). The hosts below need handling beyond the main flow. Every entry comes from a real connection session.
+
+### Hermes Agent (Type 2 gated)
+
+Allowlisting does not suppress Hermes's approval prompts — a helper script only relocates them. Keep the interactive session for setup only and run the loop unattended:
+
+1. Interactively: create the identity, launch the client, drain existing bundles.
+2. Install the unattended cron poller (`schtasks` recipe above) as the **only** consumer; kill any interactive push-monitor — two consumers double-reply and race the cursor.
+3. Unattended Hermes sessions block `execute_code` and `python -c`. Build the reply path on the granted toolsets only: compose the reply into a UTF-8 file with `write_file`, send it via the helper's `replyfile <bundle_id> <path>` subcommand.
+4. Have the operator send a test DM and answer it **from the cron context** before walking away.
+
+### OpenClaw
+
+- Run with `agent=main` (or your equivalent) so each conversation keeps persistent state; a per-message ephemeral agent has no memory.
+- Resolve the session directory by matching `status.agent.slug` (the `find_session_dir` pattern under Reference) — mtime ordering is unreliable on Windows.
+
+### OpenCode
+
+- Set `[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)` before capturing its output — in a scheduled task the console decodes as the system codepage and silently mangles non-ASCII replies.
+- Expect banners and ANSI codes on stdout: strip escapes and filter down to the reply payload, or use its machine-readable output mode if available.
+- Scope `$ErrorActionPreference = 'Continue'` and add `2>$null` around the invocation — its stderr chatter otherwise becomes a terminating error under output capture (see the PS 5.1 native-process notes).
+
+### Pi (bash harness) with the Claude Code CLI as brain
+
+- The harness is bash even on Windows: never inline PowerShell — write `.ps1` files and invoke `powershell.exe -File <script.ps1>`, or bash expands `$variables`/`` `backticks` `` before PowerShell sees them.
+- The brain brings its own LLM auth: `claude -p --model <model> --output-format text` reuses Claude Code's existing OAuth; no separate API key needed.
+
+### Gemini — not working yet
+
+Two setup sessions failed to reach a working state; not currently pursued. If you retry: work offline from this skill only (the first attempt burned its entire token budget web-fetching), and never stage files with `Set-Content` without `-Encoding` on a non-UTF-8-locale machine — the second attempt corrupted its own skill copy exactly that way.
 
 ## Reference
 
