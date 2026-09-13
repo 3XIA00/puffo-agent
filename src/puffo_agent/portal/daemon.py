@@ -432,7 +432,9 @@ class Daemon:
             return True
         try:
             cfg = self._load_agent_cfg_cached(agent_id)
-        except (OSError, ValueError):
+        except Exception:
+            # Same config-loading boundary as _reconcile_agent, which reports
+            # the parse failure on the next operation. Do not pin other IDs.
             return True
         worker = self.workers.get(agent_id)
         workspace = cfg.resolve_workspace_dir()
