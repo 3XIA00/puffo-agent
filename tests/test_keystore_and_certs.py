@@ -72,37 +72,42 @@ class TestCanonical:
 # ---- KeyStore ----
 
 
+@pytest.mark.parametrize("key", [b"A" * 31 + b"\n", b"A" * 31 + b"\x1a"],
+                         ids=["newline", "ctrl-z"])
+def test_backup_key_persists_binary_bytes_across_reopen(tmp_path, monkeypatch, key):
+    """Windows text descriptors must not expand LF or treat Ctrl-Z as EOF."""
+    monkeypatch.setattr(os, "urandom", lambda size: key if size == 32 else b"B" * size)
+    keys_dir = tmp_path / "keys"
+    store = KeyStore(keys_dir)
+    assert store.load_or_create_message_backup_dek("agent-a") == key
+    assert (keys_dir / "agent-a.message-backup-dek-v1").read_bytes() == key
+    assert KeyStore(keys_dir).load_or_create_message_backup_dek("agent-a") == key
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Legacy Windows text-mode key files")
+def test_backup_key_reads_legacy_newlines_without_rewriting(tmp_path):
+    """An upgrade must preserve previously readable text-expanded keys."""
+    key = b"A" * 29 + b"\r\n\n"
+    legacy = key.replace(b"\n", b"\r\n")
+    path = tmp_path / "agent-a.message-backup-dek-v1"
+    path.write_bytes(legacy)
+    assert KeyStore(tmp_path).load_or_create_message_backup_dek("agent-a") == key
+    assert path.read_bytes() == legacy
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Legacy Windows text-mode key files")
+@pytest.mark.parametrize("stored", [b"A" * 31 + b"\r\nX", b"A" * 29 + b"\n\r\nX",
+                                  b"\r\n" * 32 + b"X"])
+def test_backup_key_rejects_malformed_legacy_files(tmp_path, stored):
+    """Compatibility must not accept truncated or noncanonical oversized keys."""
+    path = tmp_path / "agent-a.message-backup-dek-v1"
+    path.write_bytes(stored)
+    with pytest.raises(ValueError, match="invalid length"):
+        KeyStore(tmp_path).load_or_create_message_backup_dek("agent-a")
+    assert path.read_bytes() == stored
+
+
 class TestKeyStore:
-    def test_backup_key_roundtrip_preserves_binary_control_bytes(self, tmp_path, monkeypatch):
-        # Windows text descriptors expand LF on write and treat Ctrl-Z as EOF.
-        key = bytes(range(32))
-        real_urandom = os.urandom
-        monkeypatch.setattr(os, "urandom", lambda size: key if size == 32 else real_urandom(size))
-        store = KeyStore(tmp_path / "keys")
-        assert store.load_or_create_message_backup_dek("agent-a") == key
-        assert store._message_backup_dek_path("agent-a").read_bytes() == key
-        assert KeyStore(store.base_dir).load_or_create_message_backup_dek("agent-a") == key
-
-    @pytest.mark.skipif(os.name != "nt", reason="legacy Windows text-mode key files")
-    def test_backup_key_reads_legacy_newline_expansion_without_rotation(self, tmp_path):
-        key = b"\r\n\x1a" + b"a" * 29
-        path = tmp_path / "agent-a.message-backup-dek-v1"
-        encoded = key.replace(b"\n", b"\r\n")
-        path.write_bytes(encoded)
-        assert KeyStore(tmp_path).load_or_create_message_backup_dek("agent-a") == key
-        assert path.read_bytes() == encoded
-        path.write_bytes(key)
-        assert KeyStore(tmp_path).load_or_create_message_backup_dek("agent-a") == key
-
-    def test_backup_key_rejects_overlong_file_without_replacing_it(self, tmp_path):
-        path = tmp_path / "agent-a.message-backup-dek-v1"
-        encoded = b"\r\n" * 32 + b"x"
-        path.write_bytes(encoded)
-        path.chmod(0o600)
-        with pytest.raises(ValueError, match="invalid length"):
-            KeyStore(tmp_path).load_or_create_message_backup_dek("agent-a")
-        assert path.read_bytes() == encoded
-
     def _temp_store(self):
         d = tempfile.mkdtemp()
         return KeyStore(os.path.join(d, "keys")), d

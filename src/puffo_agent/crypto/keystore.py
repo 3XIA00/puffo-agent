@@ -121,8 +121,9 @@ class KeyStore:
             raise ValueError("message backup key is not a regular file")
         if os.name != "nt" and before.st_mode & 0o077:
             raise ValueError("message backup key file permissions are unsafe")
-        # The Windows CRT otherwise translates CRLF and treats Ctrl-Z as EOF.
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags = os.O_RDONLY
+        if os.name == "nt":
+            flags |= os.O_BINARY  # No CRLF translation or Ctrl-Z end-of-file.
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         fd = os.open(path, flags)
@@ -136,23 +137,22 @@ class KeyStore:
             ):
                 raise ValueError("message backup key file changed unsafely")
             chunks: list[bytes] = []
-            size = 0
-            while size < 65:
-                chunk = os.read(fd, 65 - size)
+            while True:
+                chunk = os.read(fd, 64)
                 if not chunk:
                     break
                 chunks.append(chunk)
-                size += len(chunk)
+                if sum(len(part) for part in chunks) > 32:
+                    break
             key = b"".join(chunks)
         finally:
             os.close(fd)
-        if os.name == "nt" and 32 < len(key) <= 64:
-            # Older Windows writers expanded every LF to CRLF. Recover only
-            # an exact reversible expansion of 32 bytes; never rotate the DEK
-            # or alter a valid binary key (including one containing CRLF).
-            legacy = key.replace(b"\r\n", b"\n")
-            if len(legacy) == 32 and legacy.replace(b"\n", b"\r\n") == key:
-                key = legacy
+        if os.name == "nt" and 32 < len(key) <= 64 and current.st_size == len(key):
+            # Older Windows writers expanded every LF to CRLF. Preserve those
+            # keys without rewriting files or changing valid 32-byte raw keys.
+            legacy_key = key.replace(b"\r\n", b"\n")
+            if len(legacy_key) == 32 and legacy_key.replace(b"\n", b"\r\n") == key:
+                key = legacy_key
         if len(key) != 32:
             raise ValueError("message backup key has invalid length")
         return key
@@ -191,7 +191,9 @@ class KeyStore:
         )
         fd: int | None = None
         try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if os.name == "nt":
+                flags |= os.O_BINARY  # Persist exactly the generated key bytes.
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             fd = os.open(temporary, flags, 0o600)
