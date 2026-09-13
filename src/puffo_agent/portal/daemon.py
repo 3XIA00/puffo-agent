@@ -382,75 +382,78 @@ class Daemon:
 
         # Agents on disk → check state and (start | stop | leave alone).
         for agent_id in sorted(on_disk):
-            try:
-                agent_cfg = self._load_agent_cfg_cached(agent_id)
-            except Exception as exc:
-                logger.warning("agent %s: failed to load agent.yml: %s", agent_id, exc)
-                continue
+            await self._reconcile_agent(agent_id)
 
-            desired_state = agent_cfg.state
-            worker = self.workers.get(agent_id)
+    async def _reconcile_agent(self, agent_id: str) -> None:
+        try:
+            agent_cfg = self._load_agent_cfg_cached(agent_id)
+        except Exception as exc:
+            logger.warning("agent %s: failed to load agent.yml: %s", agent_id, exc)
+            return
 
-            if desired_state == "running":
-                self._paused_reported.discard(agent_id)
-                if worker is None:
-                    logger.info("agent %s: starting worker", agent_id)
-                    worker = Worker(
-                        self.daemon_cfg,
-                        agent_cfg,
-                        notify_refresh_needed=self._notify_refresh_for(agent_cfg),
-                        ensure_fresh_token=self._ensure_fresh_for(agent_cfg),
-                        ws_local_hub=self.ws_local_hub,
-                    )
-                    self.workers[agent_id] = worker
-                    self._register_with_refresher(agent_cfg, worker)
-                    worker.start()
-                    # Serialise heavy startup: ``adapter.warm()`` reads
-                    # the persisted session into Node's heap, so N
-                    # parallel warms can OOM the host. Awaiting one at
-                    # a time keeps peak RSS bounded.
-                    await self._observe_worker_start(agent_id, worker)
-                elif (
-                    worker.restart_required
-                    or _worker_needs_restart(worker.agent_cfg, agent_cfg)
-                ):
-                    reason = (
-                        "fatal runtime exit"
-                        if worker.restart_required
-                        else "config changed"
-                    )
-                    logger.info(
-                        "agent %s: %s, restarting worker", agent_id, reason
-                    )
-                    await self._stop_worker(agent_id)
-                    worker = Worker(
-                        self.daemon_cfg,
-                        agent_cfg,
-                        notify_refresh_needed=self._notify_refresh_for(agent_cfg),
-                        ensure_fresh_token=self._ensure_fresh_for(agent_cfg),
-                        ws_local_hub=self.ws_local_hub,
-                    )
-                    self.workers[agent_id] = worker
-                    self._register_with_refresher(agent_cfg, worker)
-                    worker.start()
-                    await self._observe_worker_start(agent_id, worker)
-                else:
-                    worker.agent_cfg = agent_cfg
-            elif desired_state == "paused":
-                if worker is not None:
-                    logger.info("agent %s: state=paused, stopping worker", agent_id)
-                    await self._stop_worker(agent_id)
-                    # Worker's gone → it can't heartbeat "paused"; the daemon
-                    # reports it so the operator's portal reflects the pause.
-                    if await _report_lifecycle(agent_cfg, "paused"):
-                        self._paused_reported.add(agent_id)
-                elif agent_id not in self._paused_reported:
-                    # Paused with no worker (e.g. after a daemon restart) —
-                    # assert the state once so the portal isn't stuck stale.
-                    if await _report_lifecycle(agent_cfg, "paused"):
-                        self._paused_reported.add(agent_id)
+        desired_state = agent_cfg.state
+        worker = self.workers.get(agent_id)
+
+        if desired_state == "running":
+            self._paused_reported.discard(agent_id)
+            if worker is None:
+                logger.info("agent %s: starting worker", agent_id)
+                worker = Worker(
+                    self.daemon_cfg,
+                    agent_cfg,
+                    notify_refresh_needed=self._notify_refresh_for(agent_cfg),
+                    ensure_fresh_token=self._ensure_fresh_for(agent_cfg),
+                    ws_local_hub=self.ws_local_hub,
+                )
+                self.workers[agent_id] = worker
+                self._register_with_refresher(agent_cfg, worker)
+                worker.start()
+                # Serialise heavy startup: ``adapter.warm()`` reads
+                # the persisted session into Node's heap, so N
+                # parallel warms can OOM the host. Awaiting one at
+                # a time keeps peak RSS bounded.
+                await self._observe_worker_start(agent_id, worker)
+            elif (
+                worker.restart_required
+                or _worker_needs_restart(worker.agent_cfg, agent_cfg)
+            ):
+                reason = (
+                    "fatal runtime exit"
+                    if worker.restart_required
+                    else "config changed"
+                )
+                logger.info(
+                    "agent %s: %s, restarting worker", agent_id, reason
+                )
+                await self._stop_worker(agent_id)
+                worker = Worker(
+                    self.daemon_cfg,
+                    agent_cfg,
+                    notify_refresh_needed=self._notify_refresh_for(agent_cfg),
+                    ensure_fresh_token=self._ensure_fresh_for(agent_cfg),
+                    ws_local_hub=self.ws_local_hub,
+                )
+                self.workers[agent_id] = worker
+                self._register_with_refresher(agent_cfg, worker)
+                worker.start()
+                await self._observe_worker_start(agent_id, worker)
             else:
-                logger.warning("agent %s: unknown state %r", agent_id, desired_state)
+                worker.agent_cfg = agent_cfg
+        elif desired_state == "paused":
+            if worker is not None:
+                logger.info("agent %s: state=paused, stopping worker", agent_id)
+                await self._stop_worker(agent_id)
+                # Worker's gone → it can't heartbeat "paused"; the daemon
+                # reports it so the operator's portal reflects the pause.
+                if await _report_lifecycle(agent_cfg, "paused"):
+                    self._paused_reported.add(agent_id)
+            elif agent_id not in self._paused_reported:
+                # Paused with no worker (e.g. after a daemon restart) —
+                # assert the state once so the portal isn't stuck stale.
+                if await _report_lifecycle(agent_cfg, "paused"):
+                    self._paused_reported.add(agent_id)
+        else:
+            logger.warning("agent %s: unknown state %r", agent_id, desired_state)
 
     async def _observe_worker_start(self, agent_id: str, worker: Worker) -> None:
         if await worker.wait_warm(timeout=self._warm_serialise_timeout):
