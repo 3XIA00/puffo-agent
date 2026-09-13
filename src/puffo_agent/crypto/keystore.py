@@ -121,7 +121,8 @@ class KeyStore:
             raise ValueError("message backup key is not a regular file")
         if os.name != "nt" and before.st_mode & 0o077:
             raise ValueError("message backup key file permissions are unsafe")
-        flags = os.O_RDONLY
+        # The Windows CRT otherwise translates CRLF and treats Ctrl-Z as EOF.
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         fd = os.open(path, flags)
@@ -135,16 +136,23 @@ class KeyStore:
             ):
                 raise ValueError("message backup key file changed unsafely")
             chunks: list[bytes] = []
-            while True:
-                chunk = os.read(fd, 64)
+            size = 0
+            while size < 65:
+                chunk = os.read(fd, 65 - size)
                 if not chunk:
                     break
                 chunks.append(chunk)
-                if sum(len(part) for part in chunks) > 32:
-                    break
+                size += len(chunk)
             key = b"".join(chunks)
         finally:
             os.close(fd)
+        if os.name == "nt" and 32 < len(key) <= 64:
+            # Older Windows writers expanded every LF to CRLF. Recover only
+            # an exact reversible expansion of 32 bytes; never rotate the DEK
+            # or alter a valid binary key (including one containing CRLF).
+            legacy = key.replace(b"\r\n", b"\n")
+            if len(legacy) == 32 and legacy.replace(b"\n", b"\r\n") == key:
+                key = legacy
         if len(key) != 32:
             raise ValueError("message backup key has invalid length")
         return key
@@ -183,7 +191,7 @@ class KeyStore:
         )
         fd: int | None = None
         try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             fd = os.open(temporary, flags, 0o600)

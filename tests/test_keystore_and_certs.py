@@ -3,6 +3,8 @@ import sys
 import tempfile
 import time
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.crypto.canonical import canonicalize, canonicalize_for_signing
@@ -71,6 +73,36 @@ class TestCanonical:
 
 
 class TestKeyStore:
+    def test_backup_key_roundtrip_preserves_binary_control_bytes(self, tmp_path, monkeypatch):
+        # Windows text descriptors expand LF on write and treat Ctrl-Z as EOF.
+        key = bytes(range(32))
+        real_urandom = os.urandom
+        monkeypatch.setattr(os, "urandom", lambda size: key if size == 32 else real_urandom(size))
+        store = KeyStore(tmp_path / "keys")
+        assert store.load_or_create_message_backup_dek("agent-a") == key
+        assert store._message_backup_dek_path("agent-a").read_bytes() == key
+        assert KeyStore(store.base_dir).load_or_create_message_backup_dek("agent-a") == key
+
+    @pytest.mark.skipif(os.name != "nt", reason="legacy Windows text-mode key files")
+    def test_backup_key_reads_legacy_newline_expansion_without_rotation(self, tmp_path):
+        key = b"\r\n\x1a" + b"a" * 29
+        path = tmp_path / "agent-a.message-backup-dek-v1"
+        encoded = key.replace(b"\n", b"\r\n")
+        path.write_bytes(encoded)
+        assert KeyStore(tmp_path).load_or_create_message_backup_dek("agent-a") == key
+        assert path.read_bytes() == encoded
+        path.write_bytes(key)
+        assert KeyStore(tmp_path).load_or_create_message_backup_dek("agent-a") == key
+
+    def test_backup_key_rejects_overlong_file_without_replacing_it(self, tmp_path):
+        path = tmp_path / "agent-a.message-backup-dek-v1"
+        encoded = b"\r\n" * 32 + b"x"
+        path.write_bytes(encoded)
+        path.chmod(0o600)
+        with pytest.raises(ValueError, match="invalid length"):
+            KeyStore(tmp_path).load_or_create_message_backup_dek("agent-a")
+        assert path.read_bytes() == encoded
+
     def _temp_store(self):
         d = tempfile.mkdtemp()
         return KeyStore(os.path.join(d, "keys")), d
