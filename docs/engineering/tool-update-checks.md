@@ -44,8 +44,8 @@ Server and Web changes must be deployed together before enabling this feature.
 
 Stable installations never follow a prerelease/platform/snapshot dist-tag.
 Numeric alpha/beta/rc versions use their matching tag; unsupported dev/build
-versions are skipped. A Pi version matching the legacy-node20 tag remains on
-that tag. Unknown installation methods get the official documentation link,
+versions are skipped. Pi versions at or below the legacy-node20 tag are skipped: npm does not
+retain the installed dist-tag, so their legacy/latest channel is ambiguous. Unknown installation methods get the official documentation link,
 not a guessed upgrade command. Only recognized Homebrew paths get a concrete
 `brew upgrade` command. App-bundled CLIs and editable LingTai source installs
 are skipped because their update authority is not the standalone package.

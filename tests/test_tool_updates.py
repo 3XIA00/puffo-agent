@@ -238,3 +238,33 @@ async def test_delivery_requires_commit_ack_and_signs_the_exact_body(monkeypatch
     response.status = 202
     with pytest.raises(RuntimeError):
         await delivery._deliver(pairing, {"message_id": "same"})
+
+
+@pytest.mark.asyncio
+async def test_pi_legacy_overlap_does_not_suggest_incompatible_latest(tmp_path, monkeypatch):
+    """A moving legacy tag must not turn an older Node20 install into latest."""
+    monkeypatch.setattr(sources, "_npm_package", lambda tool, exe: tool.package)
+    monkeypatch.setattr(sources, "_fetch_json", AsyncMock(return_value={
+        "latest": "0.85.1", "legacy-node20": "0.74.2",
+    }))
+    for current in ("0.74.1", "0.74.2"):
+        with pytest.raises(ValueError, match="ambiguous"):
+            await sources._check(sources.TOOLS[2], str(tmp_path / "pi"), current)
+    update = await sources._check(sources.TOOLS[2], str(tmp_path / "pi"), "0.80.0")
+    assert update.latest == "0.85.1"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="macOS app bundle symlink layout")
+@pytest.mark.asyncio
+async def test_app_bundled_symlink_does_not_use_standalone_releases(tmp_path, monkeypatch):
+    """A PATH alias must preserve the application's release authority."""
+    binary = tmp_path / "Example.app/Contents/MacOS/codex"
+    binary.parent.mkdir(parents=True)
+    binary.touch()
+    alias = tmp_path / "codex"
+    alias.symlink_to(binary)
+    fetch = AsyncMock()
+    monkeypatch.setattr(sources, "_fetch_json", fetch)
+    with pytest.raises(ValueError, match="app-bundled"):
+        await sources._check(sources.TOOLS[0], str(alias), "1.0.0")
+    fetch.assert_not_awaited()

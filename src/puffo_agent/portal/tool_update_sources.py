@@ -221,13 +221,16 @@ async def _check(tool: Tool, executable: str, current: str) -> Update | None:
         source = "https://api.github.com/repos/Lingtai-AI/lingtai-kernel/releases/latest"
         latest = await _lingtai_latest()
     else:
-        if ".app/Contents/" in executable:
+        if ".app/Contents/" in Path(executable).resolve().as_posix():
             raise ValueError("app-bundled CLI must follow its parent application's releases")
         package = await asyncio.to_thread(_npm_package, tool, executable)
         source = f"https://registry.npmjs.org/-/package/{quote(package, safe='')}/dist-tags"
         tags = await _fetch_json(source)
-        if tool.key == "pi" and tags.get("legacy-node20") == current:
-            channel = "legacy-node20"
+        if tool.key == "pi" and "legacy-node20" in tags:
+            # npm does not retain the original dist-tag. Overlapping versions
+            # cannot establish whether this installation follows the legacy line.
+            if Version(current) <= Version(_version(tags["legacy-node20"])):
+                raise ValueError("Pi legacy/latest channel is ambiguous")
         latest = tags.get(channel)
         if not isinstance(latest, str):
             raise ValueError("update channel unavailable")
