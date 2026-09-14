@@ -267,6 +267,11 @@ class Daemon:
         runtime.runtime_tasks.append(
             spawn(LingtaiProfileSync().run_loop(self._stop), name="lingtai_profile_sync")
         )
+        from .tool_updates import ToolUpdateChecker
+
+        runtime.runtime_tasks.append(
+            spawn(ToolUpdateChecker().run_loop(self._stop), name="tool_update_check")
+        )
         from .control.client import ControlManager
 
         runtime.control_manager = ControlManager(
