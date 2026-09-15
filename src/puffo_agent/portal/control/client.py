@@ -770,15 +770,22 @@ class MachineControlClient:
         (e.g. a CLI tool gets authed). Capability compute runs off-thread so a
         stale model-catalog fetch never blocks the heartbeat."""
         last_caps = initial_caps
-        while not stop.is_set():
-            await _sleep_or_stop(stop, HEARTBEAT_INTERVAL_SECONDS)
-            if stop.is_set():
-                break
-            await self._send(ws, {"type": "heartbeat"})
-            caps = await asyncio.to_thread(build_capabilities)
-            if caps != last_caps:
-                await self._send(ws, {"type": "capabilities", "capabilities": caps})
-                last_caps = caps
+        try:
+            while not stop.is_set():
+                await _sleep_or_stop(stop, HEARTBEAT_INTERVAL_SECONDS)
+                if stop.is_set():
+                    break
+                await self._send(ws, {"type": "heartbeat"})
+                caps = await asyncio.to_thread(build_capabilities)
+                if caps != last_caps:
+                    await self._send(ws, {"type": "capabilities", "capabilities": caps})
+                    last_caps = caps
+        except Exception:
+            # Wake the receive loop so run() can reconnect even when the
+            # peer never sends another frame after a writer failure.
+            log.warning("control: periodic sender failed; reconnecting", exc_info=True)
+            await ws.close()
+            raise
 
     async def _handle(
         self,

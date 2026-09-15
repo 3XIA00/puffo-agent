@@ -61,6 +61,42 @@ class _ControlSession:
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_failure_releases_idle_control_connection(monkeypatch):
+    """A failed writer must not strand reconnection behind an idle reader."""
+    receiving = asyncio.Event()
+    closed = asyncio.Event()
+
+    class BrokenWriterWS(_StreamingWS):
+        async def __anext__(self):
+            receiving.set()
+            await closed.wait()
+            raise StopAsyncIteration
+
+        async def send_json(self, obj):
+            if obj.get("type") == "heartbeat":
+                await receiving.wait()
+                raise ConnectionResetError("synthetic lost connection")
+            await super().send_json(obj)
+
+        async def close(self):
+            closed.set()
+
+    ws = BrokenWriterWS([])
+    monkeypatch.setattr(cc, "load_pairings", lambda: {
+        "op": types.SimpleNamespace(server_url="https://example.invalid"),
+    })
+    monkeypatch.setattr(cc, "create_remote_http_session", lambda base: _ControlSession(ws))
+    monkeypatch.setattr(cc.machine_auth, "ws_connect_frame", lambda machine: {})
+    monkeypatch.setattr(cc, "build_capabilities", lambda: {})
+    monkeypatch.setattr(cc, "HEARTBEAT_INTERVAL_SECONDS", 0)
+    await asyncio.wait_for(
+        MachineControlClient(machine=object())._connect_once(asyncio.Event()),
+        timeout=1,
+    )
+    assert closed.is_set()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("server_frame", "connected_logged"),
     [
