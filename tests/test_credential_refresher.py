@@ -986,14 +986,18 @@ def test_probe_uses_default_model_after_latch_persists_across_calls(
 
 
 def test_refresh_probe_model_honors_env_var_override(monkeypatch):
-    # Reload the module with the env var set so the module-level
-    # constant picks it up. Verifies the operator escape hatch works.
-    import importlib
+    # Import in a fresh process: reloading here replaces RefreshOutcome while
+    # other collected tests retain the old enum and misclassify auth failures.
+    import subprocess
+    import sys
+
     monkeypatch.setenv("PUFFO_AGENT_REFRESH_MODEL", "claude-sonnet-4-6-fake")
-    reloaded = importlib.reload(credential_refresh)
-    try:
-        assert reloaded.REFRESH_PROBE_MODEL == "claude-sonnet-4-6-fake"
-    finally:
-        # Restore the original module state for downstream tests.
-        monkeypatch.delenv("PUFFO_AGENT_REFRESH_MODEL", raising=False)
-        importlib.reload(credential_refresh)
+    result = subprocess.run(
+        [sys.executable, "-c", (
+            "from puffo_agent.portal.credential_refresh import REFRESH_PROBE_MODEL; "
+            "print(REFRESH_PROBE_MODEL)"
+        )],
+        cwd=Path(__file__).resolve().parents[1] / "src",
+        check=True, capture_output=True, text=True, timeout=15,
+    )
+    assert result.stdout.strip() == "claude-sonnet-4-6-fake"
