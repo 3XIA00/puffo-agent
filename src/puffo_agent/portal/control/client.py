@@ -781,10 +781,12 @@ class MachineControlClient:
                     await self._send(ws, {"type": "capabilities", "capabilities": caps})
                     last_caps = caps
         except Exception:
-            # Wake the receive loop so run() can reconnect even when the
-            # peer never sends another frame after a writer failure.
+            # aiohttp has no public WebSocket abort API. Its graceful close
+            # can block writing CLOSE before its close timeout even starts.
+            # Abort this failed transport to release both reader and writer;
+            # the existing receive-loop finalizer settles the socket/task.
             log.warning("control: periodic sender failed; reconnecting", exc_info=True)
-            await ws.close()
+            ws._writer.transport.abort()
             raise
 
     async def _handle(
