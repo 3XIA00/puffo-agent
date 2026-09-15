@@ -61,6 +61,84 @@ class _ControlSession:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stop_on_failure", [False, True])
+async def test_failed_sender_releases_paused_transport(monkeypatch, stop_on_failure):
+    """A blocked CLOSE write must not prevent reconnect or stop completion."""
+    from aiohttp import web
+
+    stop = asyncio.Event()
+    release_server = asyncio.Event()
+    sockets, transports, protocols, heartbeats = [], [], [], []
+    original_send = cc.aiohttp.ClientWebSocketResponse.send_json
+    original_spawn = cc.spawn
+
+    async def handle(request):
+        ws = web.WebSocketResponse(autoclose=False)
+        await ws.prepare(request)
+        sockets.append(ws)
+        if len(sockets) == 2:
+            stop.set()
+            await ws.close()
+        else:
+            # The failed peer never acknowledges CLOSE.
+            await release_server.wait()
+        return ws
+
+    async def send(ws, obj, **kwargs):
+        if obj.get("type") == "heartbeat" and not transports:
+            while not ws._waiting:
+                await asyncio.sleep(0)
+            transports.append(ws._writer.transport)
+            protocols.append(ws._writer.protocol)
+            ws._writer.protocol.pause_writing()
+            ws._writer._output_size = ws._writer._limit + 1
+            if stop_on_failure:
+                stop.set()
+            raise ConnectionResetError("synthetic paused writer failure")
+        return await original_send(ws, obj, **kwargs)
+
+    def spawn(coro, **kwargs):
+        task = original_spawn(coro, **kwargs)
+        heartbeats.append(task)
+        return task
+
+    app = web.Application()
+    app.router.add_get("/v2/machines/subscribe", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    monkeypatch.setattr(cc, "load_pairings", lambda: {
+        "op": types.SimpleNamespace(server_url=f"http://127.0.0.1:{port}"),
+    })
+    monkeypatch.setattr(cc, "create_remote_http_session", lambda base: cc.aiohttp.ClientSession())
+    monkeypatch.setattr(cc.machine_auth, "ws_connect_frame", lambda machine: {})
+    monkeypatch.setattr(cc, "build_capabilities", lambda: {})
+    monkeypatch.setattr(cc, "HEARTBEAT_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(cc, "RECONNECT_BACKOFF_SECONDS", 0)
+    monkeypatch.setattr(cc, "spawn", spawn)
+    monkeypatch.setattr(cc.aiohttp.ClientWebSocketResponse, "send_json", send)
+    task = asyncio.create_task(MachineControlClient(object()).run(stop))
+    try:
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert done, "failed connection stayed blocked in close-frame drain"
+        await task
+        assert transports and all(t.is_closing() for t in transports)
+        assert all(p.transport is None for p in protocols)
+        assert len(sockets) == (1 if stop_on_failure else 2)
+        assert len(heartbeats) == len(sockets)
+        assert all(t.done() for t in heartbeats)
+    finally:
+        for transport in transports:
+            transport.abort()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        release_server.set()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("server_frame", "connected_logged"),
     [
