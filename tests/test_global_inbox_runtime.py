@@ -1549,6 +1549,16 @@ async def test_global_turn_plain_output_is_internal_not_an_implicit_message(tmp_
                 metadata={"assistant_text_parts": ["No further reply is needed."]},
             )
 
+        # Since PUF-400 a plain answer earns one corrective ask naming the
+        # tool. This stub refuses to take it, so the assertions below stand
+        # exactly as they did: plain output is internal and never becomes an
+        # implicit message.
+        async def run_retry_turn(self, _kick, _fallback, _ctx):
+            return TurnResult(
+                reply="No further reply is needed.",
+                metadata={"assistant_text_parts": ["No further reply is needed."]},
+            )
+
     planned = SimpleNamespace(
         provider_input="<exact-global-input>",
         targets=(object(),),
