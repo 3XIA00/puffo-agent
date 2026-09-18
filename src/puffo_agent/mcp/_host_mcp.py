@@ -34,15 +34,23 @@ _SECRET_KEYS = re.compile(
 # everything else is redacted. Extend these sets when the daemon starts
 # returning new codes — an unlisted code costs one lookup in the daemon
 # log, a leaked credential cannot be recalled.
+# Every value below is a literal this repo actually returns; extend
+# only from real interface contracts, never invented names.
 _KNOWN_DIAGNOSTIC_CODES = frozenset({
-    # failure taxonomy already used in this repo
-    "runtime_not_ready", "invalid_resume", "provider_unavailable",
-    "provider_error", "transport", "malformed_ack", "malformed_response",
-    "capacity", "quota_exhausted",
-    # categories the tool-connectors plan to return with real 4xx bodies
-    "reauth_required", "cloud_config_error", "operator_denied",
-    "permission_denied", "not_found", "invalid_request", "rate_limited",
-    "internal",
+    # provider failure taxonomy (agent/provider_failures.py)
+    "authentication", "permission_denied", "model_not_found",
+    "not_entitled", "budget_exceeded", "plan_drained",
+    "extra_usage_required", "quota_exhausted", "rate_limit",
+    "provider_unavailable", "provider_error", "runtime_exited",
+    "resume_unconfirmed", "protocol_error", "cancel_failed", "unknown",
+    # control / runtime / receipt codes emitted elsewhere in this repo
+    "invalid_command", "agent_start_failed", "agent_start_timeout",
+    "command_rejected", "command_failed", "harness_not_ready",
+    "runtime_not_ready", "acp_prompt_failed", "cancelled",
+    "command_lifecycle_protocol", "invalid_resume",
+    "input_admission_ambiguous", "turn_timeout", "runtime_closed",
+    "operator_recovery_required", "event_persistence_failed",
+    "transport", "malformed_ack", "malformed_response", "capacity",
 })
 _KNOWN_DIAGNOSTIC_STATES = frozenset({
     # send / staging / reminder lifecycle states on this interface

@@ -33,7 +33,7 @@ async def test_rich_error_body_survives_into_the_exception():
     rpc, http = await _serving_client(
         {
             "error": "permission denied by operator",
-            "code": "operator_denied",
+            "code": "permission_denied",
             "hint": "re-run /permissions and approve host-mcp",
             "request_id": "req-123",
         },
@@ -48,7 +48,7 @@ async def test_rich_error_body_survives_into_the_exception():
     message = str(excinfo.value)
     assert "rpc sync-mcp failed with status 403" in message
     assert "permission denied by operator" in message
-    assert "operator_denied" in message
+    assert "permission_denied" in message
     assert "re-run /permissions and approve host-mcp" in message
     assert "req-123" in message
 
@@ -183,7 +183,7 @@ async def test_snake_shaped_secret_code_and_state_are_still_redacted():
 async def test_enum_shaped_diagnostic_code_and_state_survive():
     """Known error codes and state enums are the diagnosis — they pass."""
     rpc, http = await _serving_client(
-        {"error": "send rejected", "code": "operator_denied", "state": "held"},
+        {"error": "send rejected", "code": "permission_denied", "state": "held"},
         400,
     )
     try:
@@ -193,7 +193,7 @@ async def test_enum_shaped_diagnostic_code_and_state_survive():
         await rpc.close()
         await http.close()
     message = str(excinfo.value)
-    assert "operator_denied" in message
+    assert "permission_denied" in message
     assert "held" in message
 
 
