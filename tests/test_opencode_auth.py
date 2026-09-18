@@ -408,6 +408,12 @@ def test_model_probe_decodes_utf8_regardless_of_locale(monkeypatch):
     real_run = subprocess.run
 
     def relay_run(command, **kwargs):
+        # Locale-independent guard: on UTF-8 (Linux CI) and cp1252
+        # (Windows CI) locales these bytes decode without error either
+        # way, so the behavioral assertion below cannot distinguish
+        # fixed from broken there — only cp936-class hosts can. Pin the
+        # decode contract explicitly so the regression fails on CI too.
+        assert kwargs.get("encoding") == "utf-8", kwargs
         # Keep every kwarg the probe supplied (this is what is under
         # test); only substitute a child that emits raw UTF-8 bytes so
         # the emission side is locale-independent.
