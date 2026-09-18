@@ -100,6 +100,78 @@ async def test_oversized_detail_is_bounded_and_codes_survive_truncation():
 
 
 @pytest.mark.asyncio
+async def test_many_short_filler_fields_cannot_crowd_out_diagnostics():
+    """Jeff's counterexample: length-sorting alone lets a crowd of short
+    junk fields exhaust the budget; diagnostics must be prioritized."""
+    body: dict[str, Any] = {
+        "error": "internal",
+        "code": "quota_storm",
+        "reason": "burst limit exceeded",
+    }
+    body.update({f"filler_{i:02d}": "v" * 10 for i in range(60)})
+    rpc, http = await _serving_client(body, 500)
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await rpc.read_inbox()
+    finally:
+        await rpc.close()
+        await http.close()
+    message = str(excinfo.value)
+    assert "quota_storm" in message
+    assert "burst limit exceeded" in message
+    assert len(message) < 700
+
+
+@pytest.mark.asyncio
+async def test_opaque_oauth_code_and_state_are_redacted():
+    """Jeff's counterexample: an OAuth authorization code or CSRF state
+    is an opaque string no shape regex catches — top-level, nested, and
+    inside a URL query it may not ride along raw."""
+    rpc, http = await _serving_client(
+        {
+            "error": "authorization failed",
+            "code": "SplxlOBeZQQYbYS6WxSbIA",
+            "state": "af0ifjsldkj-9XQ",
+            "details": {"oauth": {"code": "SplxlOBeZQQYbYS6WxSbIA"}},
+            "redirect": (
+                "https://cloud.example/cb"
+                "?code=SplxlOBeZQQYbYS6WxSbIA&state=af0ifjsldkj-9XQ"
+            ),
+        },
+        401,
+    )
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await rpc.sync_mcp(template_id="tpl-1")
+    finally:
+        await rpc.close()
+        await http.close()
+    message = str(excinfo.value)
+    assert "SplxlOBeZQQYbYS6WxSbIA" not in message
+    assert "af0ifjsldkj-9XQ" not in message
+    assert "[REDACTED]" in message
+    assert "authorization failed" in message
+
+
+@pytest.mark.asyncio
+async def test_enum_shaped_diagnostic_code_and_state_survive():
+    """Known error codes and state enums are the diagnosis — they pass."""
+    rpc, http = await _serving_client(
+        {"error": "send rejected", "code": "operator_denied", "state": "held"},
+        400,
+    )
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await rpc.send_message(channel="ch_a", text="hello")
+    finally:
+        await rpc.close()
+        await http.close()
+    message = str(excinfo.value)
+    assert "operator_denied" in message
+    assert "held" in message
+
+
+@pytest.mark.asyncio
 async def test_credentials_are_redacted_from_the_detail_tail():
     """Secret-named keys and secret-shaped values never ride along raw."""
     rpc, http = await _serving_client(

@@ -27,6 +27,41 @@ _SECRET_KEYS = re.compile(
     r"(?i)(?:^|[_-])(?:token|secret|password|passwd|authorization|cookie|"
     r"credential|api[_-]?key|verifier)(?:$|[_-])"
 )
+# An OAuth authorization code or CSRF state is an opaque string that no
+# shape regex can promise to catch, so ``code``/``state`` values pass
+# through only when they look like an enum/identifier diagnostic —
+# single-case snake words like ``operator_denied`` or ``HELD``. Opaque
+# blobs are mixed-case/dashed, indistinguishable from credentials, and
+# get redacted.
+_ENUMISH = re.compile(r"^(?:[a-z][a-z0-9_]{0,31}|[A-Z][A-Z0-9_]{0,31})$")
+_QUERY_SECRETS = re.compile(
+    r"(?i)([?&#](?:code|state|access_token|refresh_token|id_token|token|"
+    r"client_secret|code_verifier)=)[^&#\s\"']+"
+)
+# Serialization priority under the truncation budget: stable diagnostic
+# fields first (in this order), everything else shortest-first.
+_DIAGNOSTIC_PRIORITY = (
+    "code", "error_code", "state", "reason", "category",
+    "message", "hint", "request_id", "retryable",
+)
+
+
+def _sanitize_detail(value: Any, *, key: str = "") -> Any:
+    lowered = key.lower()
+    if _SECRET_KEYS.search(lowered):
+        return "[REDACTED]"
+    if lowered in ("code", "state") and not (
+        isinstance(value, (bool, int))
+        or (isinstance(value, str) and _ENUMISH.fullmatch(value))
+    ):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {
+            k: _sanitize_detail(v, key=str(k)) for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_detail(item) for item in value]
+    return value
 
 
 def _encode_detail_value(value: Any) -> str:
@@ -36,44 +71,54 @@ def _encode_detail_value(value: Any) -> str:
         return json.dumps(str(value), ensure_ascii=False)
 
 
+def _redact_detail_text(text: str) -> str:
+    text = _TOKENISH.sub("[REDACTED]", text)
+    return _QUERY_SECRETS.sub(r"\g<1>[REDACTED]", text)
+
+
 def _rpc_failure_message(route: str, status: int, data: Any) -> str:
     """Carry the daemon's whole failure body into the raised error.
 
     A 4xx body is the diagnosis — re-auth needed vs cloud config vs an
     operator denial — so beyond the ``error`` headline every remaining
     field rides along as a bounded JSON tail instead of being discarded.
-    Shortest fields serialize first so stable error codes and reasons
-    survive the truncation even when one field is a page-long trace, and
-    credential-named keys or secret-shaped values are redacted.
+    Stable diagnostic fields serialize first so codes and reasons survive
+    the truncation budget regardless of how many other fields the body
+    carries; credential-named keys, secret-shaped values, opaque
+    ``code``/``state`` values, and secret URL query params are redacted.
     """
     headline = f"rpc {route} failed with status {status}"
     error = data.get("error") if isinstance(data, dict) else None
     headlined_error = isinstance(error, str) and bool(error)
     if headlined_error:
-        headline = f"{headline}: {_TOKENISH.sub('[REDACTED]', error)}"
+        headline = f"{headline}: {_redact_detail_text(error)}"
     if isinstance(data, dict):
         residue: Any = {
-            key: ("[REDACTED]" if _SECRET_KEYS.search(str(key)) else value)
+            key: _sanitize_detail(value, key=str(key))
             for key, value in data.items()
             if (key != "error" or not headlined_error)
             and value not in (None, "")
         }
     else:
-        residue = data
+        residue = _sanitize_detail(data)
     if residue in (None, "", {}, []):
         return headline
     if isinstance(residue, dict):
-        fields = sorted(
+        rank = {name: idx for idx, name in enumerate(_DIAGNOSTIC_PRIORITY)}
+        fields = [
             (
-                f"{_encode_detail_value(str(key))}:{_encode_detail_value(value)}"
-                for key, value in residue.items()
-            ),
-            key=len,
+                str(key).lower(),
+                f"{_encode_detail_value(str(key))}:{_encode_detail_value(value)}",
+            )
+            for key, value in residue.items()
+        ]
+        fields.sort(
+            key=lambda item: (rank.get(item[0], len(rank)), len(item[1])),
         )
-        tail = "{" + ",".join(fields) + "}"
+        tail = "{" + ",".join(encoded for _, encoded in fields) + "}"
     else:
         tail = _encode_detail_value(residue)
-    tail = _TOKENISH.sub("[REDACTED]", tail)
+    tail = _redact_detail_text(tail)
     return f"{headline} detail={tail[:_RPC_FAILURE_DETAIL_MAX_CHARS]}"
 
 
