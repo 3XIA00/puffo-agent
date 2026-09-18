@@ -73,10 +73,16 @@ async def test_body_without_error_headline_still_reaches_the_exception():
 
 
 @pytest.mark.asyncio
-async def test_oversized_detail_is_bounded():
-    """A pathological body may not turn the exception into a log bomb."""
+async def test_oversized_detail_is_bounded_and_codes_survive_truncation():
+    """A pathological body may not turn the exception into a log bomb,
+    and short stable fields must outlive a page-long trace."""
     rpc, http = await _serving_client(
-        {"error": "internal", "trace": "x" * 2000},
+        {
+            "error": "internal",
+            "trace": "x" * 2000,
+            "code": "quota_storm",
+            "reason": "burst limit exceeded",
+        },
         500,
     )
     try:
@@ -87,8 +93,36 @@ async def test_oversized_detail_is_bounded():
         await http.close()
     message = str(excinfo.value)
     assert "rpc send-message failed with status 500: internal" in message
+    assert "quota_storm" in message
+    assert "burst limit exceeded" in message
     assert "xxx" in message
-    assert len(message) < 600
+    assert len(message) < 700
+
+
+@pytest.mark.asyncio
+async def test_credentials_are_redacted_from_the_detail_tail():
+    """Secret-named keys and secret-shaped values never ride along raw."""
+    rpc, http = await _serving_client(
+        {
+            "error": "cloud re-auth required: bearer sk-abcdefgh12345678 expired",
+            "access_token": "sk-abcdefgh12345678",
+            "client_secret": "hunter2hunter2",
+            "hint": "run /login again",
+        },
+        401,
+    )
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await rpc.sync_mcp(template_id="tpl-1")
+    finally:
+        await rpc.close()
+        await http.close()
+    message = str(excinfo.value)
+    assert "sk-abcdefgh12345678" not in message
+    assert "hunter2hunter2" not in message
+    assert "[REDACTED]" in message
+    assert "cloud re-auth required" in message
+    assert "run /login again" in message
 
 
 @pytest.mark.asyncio

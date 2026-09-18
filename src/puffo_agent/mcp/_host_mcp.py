@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import urllib.parse
 from typing import Any, Optional
 
@@ -16,6 +17,23 @@ from ..portal.local_service_auth import local_service_headers
 logger = logging.getLogger(__name__)
 
 _RPC_FAILURE_DETAIL_MAX_CHARS = 500
+# Parity with ``agent._logging._TOKENISH``: this tail rides into
+# exceptions and logs, so secret-shaped values may not survive raw.
+_TOKENISH = re.compile(
+    r"(?i)(?:bearer\s+\S+|(?:access|refresh|id)[_-]?token\s*[:=]\s*\S+|"
+    r"sk-[a-z0-9_-]{12,}|eyJ[a-zA-Z0-9_-]{12,}\.[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)?)"
+)
+_SECRET_KEYS = re.compile(
+    r"(?i)(?:^|[_-])(?:token|secret|password|passwd|authorization|cookie|"
+    r"credential|api[_-]?key|verifier)(?:$|[_-])"
+)
+
+
+def _encode_detail_value(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return json.dumps(str(value), ensure_ascii=False)
 
 
 def _rpc_failure_message(route: str, status: int, data: Any) -> str:
@@ -24,15 +42,19 @@ def _rpc_failure_message(route: str, status: int, data: Any) -> str:
     A 4xx body is the diagnosis — re-auth needed vs cloud config vs an
     operator denial — so beyond the ``error`` headline every remaining
     field rides along as a bounded JSON tail instead of being discarded.
+    Shortest fields serialize first so stable error codes and reasons
+    survive the truncation even when one field is a page-long trace, and
+    credential-named keys or secret-shaped values are redacted.
     """
     headline = f"rpc {route} failed with status {status}"
     error = data.get("error") if isinstance(data, dict) else None
     headlined_error = isinstance(error, str) and bool(error)
     if headlined_error:
-        headline = f"{headline}: {error}"
+        headline = f"{headline}: {_TOKENISH.sub('[REDACTED]', error)}"
     if isinstance(data, dict):
         residue: Any = {
-            key: value for key, value in data.items()
+            key: ("[REDACTED]" if _SECRET_KEYS.search(str(key)) else value)
+            for key, value in data.items()
             if (key != "error" or not headlined_error)
             and value not in (None, "")
         }
@@ -40,10 +62,18 @@ def _rpc_failure_message(route: str, status: int, data: Any) -> str:
         residue = data
     if residue in (None, "", {}, []):
         return headline
-    try:
-        tail = json.dumps(residue, ensure_ascii=False, default=str)
-    except Exception:
-        tail = str(residue)
+    if isinstance(residue, dict):
+        fields = sorted(
+            (
+                f"{_encode_detail_value(str(key))}:{_encode_detail_value(value)}"
+                for key, value in residue.items()
+            ),
+            key=len,
+        )
+        tail = "{" + ",".join(fields) + "}"
+    else:
+        tail = _encode_detail_value(residue)
+    tail = _TOKENISH.sub("[REDACTED]", tail)
     return f"{headline} detail={tail[:_RPC_FAILURE_DETAIL_MAX_CHARS]}"
 
 
