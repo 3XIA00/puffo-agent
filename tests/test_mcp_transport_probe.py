@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 import time
 import uuid
 from pathlib import Path
@@ -252,6 +253,61 @@ def test_probe_skips_recycle_while_rpc_listener_down(
     _run(worker.probe_mcp_transport("t"))
     assert adapter.reload_calls == [False]
     assert worker._mcp_probe_strikes == 1
+
+
+@pytest.mark.asyncio
+async def test_listener_death_pauses_recycle_until_watchdog_rebinds(
+    registered_manager, monkeypatch,
+):
+    """Combined shape of the WinError-64 incident: with the real
+    service up, kill its live listener (what ProactorEventLoop does
+    after an accept OSError) and drive the worker probe. While the
+    listener is down the probe must not recycle — recycling kills MCP
+    children mid-connect and re-feeds the storm — and the watchdog
+    must rebind the same port; only then does the still-missing hello
+    recycle the agent's own runtime."""
+    reserve = socket.socket()
+    reserve.bind(("127.0.0.1", 0))
+    port = reserve.getsockname()[1]
+    reserve.close()
+
+    mgr = registered_manager(_FakeManager("g1", time.monotonic() - 120))
+    rpc_service.clear_mcp_hello("t")
+    worker = _seed_worker()
+    adapter = _wire(worker, mgr)
+
+    monkeypatch.setattr(rpc_service, "_WATCHDOG_INTERVAL_S", 0.05)
+    cfg = rpc_service.RpcServiceConfig(
+        enabled=True, bind_host="127.0.0.1", port=port,
+    )
+    runner = await rpc_service.start_rpc_service(cfg)
+    assert runner is not None
+    # start_rpc_service arms the watchdog on Windows only; arming it
+    # here directly keeps the regression deterministic on POSIX CI
+    # (idempotent when already armed).
+    rpc_service._start_listener_watchdog(cfg)
+    try:
+        # Mimic proactor_events: the accept loop closes the asyncio
+        # Server itself, beneath a still-unaware aiohttp runner.
+        for site in runner.sites:
+            site._server.close()
+        await asyncio.sleep(0)
+
+        await worker.probe_mcp_transport("t")
+        assert adapter.reload_calls == []
+        assert worker._mcp_probe_strikes == 0
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while not await rpc_service._probe_listener("127.0.0.1", port):
+            assert loop.time() < deadline, "watchdog never rebound"
+            await asyncio.sleep(0.05)
+
+        await worker.probe_mcp_transport("t")
+        assert adapter.reload_calls == [False]
+        assert worker._mcp_probe_strikes == 1
+    finally:
+        await rpc_service.stop_rpc_service(runner)
 
 
 def test_a_per_turn_harness_is_never_wedged_by_this_probe(
