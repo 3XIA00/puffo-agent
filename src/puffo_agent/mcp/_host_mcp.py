@@ -28,12 +28,27 @@ _SECRET_KEYS = re.compile(
     r"credential|api[_-]?key|verifier)(?:$|[_-])"
 )
 # An OAuth authorization code or CSRF state is an opaque string that no
-# shape regex can promise to catch, so ``code``/``state`` values pass
-# through only when they look like an enum/identifier diagnostic —
-# single-case snake words like ``operator_denied`` or ``HELD``. Opaque
-# blobs are mixed-case/dashed, indistinguishable from credentials, and
-# get redacted.
-_ENUMISH = re.compile(r"^(?:[a-z][a-z0-9_]{0,31}|[A-Z][A-Z0-9_]{0,31})$")
+# shape heuristic can promise to catch (``private_session_nonce`` is a
+# perfectly snake-shaped secret), so ``code``/``error_code``/``state``
+# values pass through only when they are *known* diagnostic values;
+# everything else is redacted. Extend these sets when the daemon starts
+# returning new codes — an unlisted code costs one lookup in the daemon
+# log, a leaked credential cannot be recalled.
+_KNOWN_DIAGNOSTIC_CODES = frozenset({
+    # failure taxonomy already used in this repo
+    "runtime_not_ready", "invalid_resume", "provider_unavailable",
+    "provider_error", "transport", "malformed_ack", "malformed_response",
+    "capacity", "quota_exhausted",
+    # categories the tool-connectors plan to return with real 4xx bodies
+    "reauth_required", "cloud_config_error", "operator_denied",
+    "permission_denied", "not_found", "invalid_request", "rate_limited",
+    "internal",
+})
+_KNOWN_DIAGNOSTIC_STATES = frozenset({
+    # send / staging / reminder lifecycle states on this interface
+    "sent", "held", "failed", "staged", "scheduled", "cancelled",
+    "delivered", "claimed", "requeued",
+})
 _QUERY_SECRETS = re.compile(
     r"(?i)([?&#](?:code|state|access_token|refresh_token|id_token|token|"
     r"client_secret|code_verifier)=)[^&#\s\"']+"
@@ -50,11 +65,16 @@ def _sanitize_detail(value: Any, *, key: str = "") -> Any:
     lowered = key.lower()
     if _SECRET_KEYS.search(lowered):
         return "[REDACTED]"
-    if lowered in ("code", "state") and not (
-        isinstance(value, (bool, int))
-        or (isinstance(value, str) and _ENUMISH.fullmatch(value))
-    ):
-        return "[REDACTED]"
+    if lowered in ("code", "error_code", "state"):
+        known = (
+            _KNOWN_DIAGNOSTIC_STATES if lowered == "state"
+            else _KNOWN_DIAGNOSTIC_CODES
+        )
+        if not (
+            isinstance(value, (bool, int))
+            or (isinstance(value, str) and value in known)
+        ):
+            return "[REDACTED]"
     if isinstance(value, dict):
         return {
             k: _sanitize_detail(v, key=str(k)) for k, v in value.items()

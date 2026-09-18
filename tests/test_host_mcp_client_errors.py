@@ -80,7 +80,7 @@ async def test_oversized_detail_is_bounded_and_codes_survive_truncation():
         {
             "error": "internal",
             "trace": "x" * 2000,
-            "code": "quota_storm",
+            "code": "quota_exhausted",
             "reason": "burst limit exceeded",
         },
         500,
@@ -93,7 +93,7 @@ async def test_oversized_detail_is_bounded_and_codes_survive_truncation():
         await http.close()
     message = str(excinfo.value)
     assert "rpc send-message failed with status 500: internal" in message
-    assert "quota_storm" in message
+    assert "quota_exhausted" in message
     assert "burst limit exceeded" in message
     assert "xxx" in message
     assert len(message) < 700
@@ -105,7 +105,7 @@ async def test_many_short_filler_fields_cannot_crowd_out_diagnostics():
     junk fields exhaust the budget; diagnostics must be prioritized."""
     body: dict[str, Any] = {
         "error": "internal",
-        "code": "quota_storm",
+        "code": "quota_exhausted",
         "reason": "burst limit exceeded",
     }
     body.update({f"filler_{i:02d}": "v" * 10 for i in range(60)})
@@ -117,7 +117,7 @@ async def test_many_short_filler_fields_cannot_crowd_out_diagnostics():
         await rpc.close()
         await http.close()
     message = str(excinfo.value)
-    assert "quota_storm" in message
+    assert "quota_exhausted" in message
     assert "burst limit exceeded" in message
     assert len(message) < 700
 
@@ -149,6 +149,32 @@ async def test_opaque_oauth_code_and_state_are_redacted():
     message = str(excinfo.value)
     assert "SplxlOBeZQQYbYS6WxSbIA" not in message
     assert "af0ifjsldkj-9XQ" not in message
+    assert "[REDACTED]" in message
+    assert "authorization failed" in message
+
+
+@pytest.mark.asyncio
+async def test_snake_shaped_secret_code_and_state_are_still_redacted():
+    """Jeff's counterexample: a secret can be a perfectly snake-shaped
+    word (``private_session_nonce``); only *known* diagnostic values
+    pass, not values that merely look like enums."""
+    rpc, http = await _serving_client(
+        {
+            "error": "authorization failed",
+            "state": "private_session_nonce",
+            "code": "snarkle_blorp",
+        },
+        401,
+    )
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await rpc.sync_mcp(template_id="tpl-1")
+    finally:
+        await rpc.close()
+        await http.close()
+    message = str(excinfo.value)
+    assert "private_session_nonce" not in message
+    assert "snarkle_blorp" not in message
     assert "[REDACTED]" in message
     assert "authorization failed" in message
 
