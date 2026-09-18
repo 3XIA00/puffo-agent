@@ -394,3 +394,35 @@ def test_discovery_invalidates_native_config_create_edit_delete(monkeypatch, tmp
     path.unlink()
     assert auth.discover_opencode_models("test") == (OpenCodeModel("a/missing"),)
     assert len(calls) == 4
+
+
+def test_model_probe_decodes_utf8_regardless_of_locale(monkeypatch):
+    """A non-ASCII UTF-8 banner in the CLI output must not break the
+    probe. text=True decoded with the locale's preferred encoding, so on
+    a CJK-locale Windows host (cp936) the banner's bytes crashed the
+    subprocess reader thread with UnicodeDecodeError — uncatchable by
+    the probe's ``except (OSError, TimeoutExpired)`` — taking down
+    discover_opencode_models and preflight with it."""
+    import sys
+
+    real_run = subprocess.run
+
+    def relay_run(command, **kwargs):
+        # Keep every kwarg the probe supplied (this is what is under
+        # test); only substitute a child that emits raw UTF-8 bytes so
+        # the emission side is locale-independent.
+        return real_run(
+            [
+                sys.executable,
+                "-c",
+                "import sys;"
+                "sys.stdout.buffer.write("
+                "('opencode/big-pickle' + chr(10)"
+                " + chr(8212) + ' update available' + chr(10))"
+                ".encode('utf-8'))",
+            ],
+            **kwargs,
+        )
+
+    monkeypatch.setattr(subprocess, "run", relay_run)
+    assert list_opencode_models("opencode") == ("opencode/big-pickle",)
