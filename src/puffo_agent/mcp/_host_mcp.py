@@ -25,8 +25,9 @@ _TOKENISH = re.compile(
 )
 _SECRET_KEYS = re.compile(
     r"(?i)(?:^|[_-])(?:token|secret|password|passwd|authorization|cookie|"
-    r"credential|api[_-]?key|verifier)(?:$|[_-])"
+    r"credential|api[_-]?key|verifier)s?(?:$|[_-])"
 )
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 # An OAuth authorization code or CSRF state is an opaque string that no
 # shape heuristic can promise to catch (``private_session_nonce`` is a
 # perfectly snake-shaped secret), so ``code``/``error_code``/``state``
@@ -70,7 +71,11 @@ _DIAGNOSTIC_PRIORITY = (
 
 
 def _sanitize_detail(value: Any, *, key: str = "") -> Any:
-    lowered = key.lower()
+    # Normalize camelCase (accessToken) to snake so the separator-based
+    # secret-key pattern sees the same shape either way; the whole value
+    # is replaced before any recursion, so ``credentials: {...}`` cannot
+    # leak through its nested fields.
+    lowered = _CAMEL_BOUNDARY.sub("_", key).lower()
     if _SECRET_KEYS.search(lowered):
         return "[REDACTED]"
     if lowered in ("code", "error_code", "state"):
@@ -78,10 +83,9 @@ def _sanitize_detail(value: Any, *, key: str = "") -> Any:
             _KNOWN_DIAGNOSTIC_STATES if lowered == "state"
             else _KNOWN_DIAGNOSTIC_CODES
         )
-        if not (
-            isinstance(value, (bool, int))
-            or (isinstance(value, str) and value in known)
-        ):
+        # These fields' contract is a string enum; any other type is an
+        # unknown value, not a loophole.
+        if not (isinstance(value, str) and value in known):
             return "[REDACTED]"
     if isinstance(value, dict):
         return {
@@ -97,6 +101,33 @@ def _encode_detail_value(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, default=str)
     except Exception:
         return json.dumps(str(value), ensure_ascii=False)
+
+
+class PuffoRpcError(RuntimeError):
+    """A non-2xx RPC response. ``status`` carries the real HTTP status
+    and ``error`` the body's headline text, so compatibility probes read
+    them structurally instead of scanning the diagnostic message for
+    digits (a ``request_id`` like ``req-404-abc`` must not read as 404).
+    """
+
+    def __init__(
+        self, message: str, *, status: int = 0, route: str = "",
+        error: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.route = route
+        self.error = error
+
+
+def _raise_rpc_failure(route: str, status: int, data: Any) -> None:
+    error = data.get("error") if isinstance(data, dict) else None
+    raise PuffoRpcError(
+        _rpc_failure_message(route, status, data),
+        status=status,
+        route=route,
+        error=error if isinstance(error, str) else "",
+    )
 
 
 def _redact_detail_text(text: str) -> str:
@@ -212,9 +243,7 @@ class PuffoRpcClient:
                         f"(status {resp.status}): {text[:500]}"
                     )
                 if resp.status >= 400:
-                    raise RuntimeError(
-                        _rpc_failure_message(route, resp.status, data)
-                    )
+                    _raise_rpc_failure(route, resp.status, data)
                 msg = (
                     data.get("message") if isinstance(data, dict) else None
                 )
@@ -254,9 +283,7 @@ class PuffoRpcClient:
                         f"(status {resp.status}): {raw[:500]}"
                     )
                 if resp.status >= 400:
-                    raise RuntimeError(
-                        _rpc_failure_message(route, resp.status, data)
-                    )
+                    _raise_rpc_failure(route, resp.status, data)
                 if not isinstance(data, dict):
                     raise RuntimeError(f"rpc {route} returned a non-object result")
                 if data.get("state") not in ("sent", "held", "failed"):
@@ -285,9 +312,7 @@ class PuffoRpcClient:
                         f"rpc {route} returned non-JSON (status {resp.status})"
                     ) from exc
                 if resp.status >= 400:
-                    raise RuntimeError(
-                        _rpc_failure_message(route, resp.status, data)
-                    )
+                    _raise_rpc_failure(route, resp.status, data)
                 if not isinstance(data, dict):
                     raise RuntimeError(f"rpc {route} returned a non-object")
                 return data
@@ -364,11 +389,7 @@ class PuffoRpcClient:
                         f"(status {resp.status}): {raw[:500]}"
                     )
                 if resp.status >= 400:
-                    raise RuntimeError(
-                        _rpc_failure_message(
-                            "model-visible-read", resp.status, data,
-                        )
-                    )
+                    _raise_rpc_failure("model-visible-read", resp.status, data)
                 if not isinstance(data, dict) or data.get("state") != "staged":
                     raise RuntimeError(
                         "rpc model-visible-read returned an invalid result"
@@ -398,9 +419,7 @@ class PuffoRpcClient:
                         f"rpc read-inbox returned non-JSON (status {resp.status})"
                     ) from exc
                 if resp.status >= 400:
-                    raise RuntimeError(
-                        _rpc_failure_message("read-inbox", resp.status, data)
-                    )
+                    _raise_rpc_failure("read-inbox", resp.status, data)
                 if not isinstance(data, dict):
                     raise RuntimeError("rpc read-inbox returned a non-object")
                 return data
@@ -457,11 +476,12 @@ class PuffoRpcClient:
             body["covers"] = covers
         try:
             data = await self._post_object("create-reminder", body)
-        except RuntimeError as exc:
+        except PuffoRpcError as exc:
             # Rolling local upgrade: an older daemon rejects the covers key
             # wholesale. The deferral matters more than the declaration, so
-            # retry without covers and report them as dropped.
-            if not covers or "accepts only" not in str(exc):
+            # retry without covers and report them as dropped. Probe the
+            # body's own error text, never the full diagnostic message.
+            if not covers or "accepts only" not in exc.error:
                 raise
             data = await self._post_object(
                 "create-reminder",
@@ -488,8 +508,10 @@ class PuffoRpcClient:
             body["note"] = note
         try:
             return await self._post_object("mark-covered", body)
-        except RuntimeError as exc:
-            if "404" in str(exc) or "failed (404)" in str(exc):
+        except PuffoRpcError as exc:
+            # Judge by the real HTTP status — a request_id like
+            # "req-404-abc" in the diagnostic tail must not read as 404.
+            if exc.status == 404:
                 raise RuntimeError(
                     "mark_covered is not available on this daemon yet "
                     "(rolling upgrade in progress); declare covers on the "

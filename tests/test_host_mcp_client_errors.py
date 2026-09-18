@@ -198,6 +198,90 @@ async def test_enum_shaped_diagnostic_code_and_state_survive():
 
 
 @pytest.mark.asyncio
+async def test_request_id_containing_404_does_not_trip_the_upgrade_probe():
+    """Jeff's finding: mark_covered used to scan the whole diagnostic
+    text for "404", so a request_id like req-404-abc rewrote a real 403
+    denial into "daemon doesn't support mark_covered"."""
+    rpc, http = await _serving_client(
+        {
+            "error": "permission denied",
+            "code": "permission_denied",
+            "reason": "operator denied",
+            "request_id": "req-404-abc",
+        },
+        403,
+    )
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await rpc.mark_covered(covers=["msg-1"])
+    finally:
+        await rpc.close()
+        await http.close()
+    message = str(excinfo.value)
+    assert "mark_covered is not available" not in message
+    assert "status 403" in message
+    assert "permission denied" in message
+    assert "req-404-abc" in message
+
+
+@pytest.mark.asyncio
+async def test_real_404_still_reads_as_rolling_upgrade():
+    """Positive control: an actual HTTP 404 keeps the friendly rewrite."""
+    rpc, http = await _serving_client({"error": "no such route"}, 404)
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await rpc.mark_covered(covers=["msg-1"])
+    finally:
+        await rpc.close()
+        await http.close()
+    assert "mark_covered is not available" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_non_string_code_and_state_are_redacted():
+    """Jeff's finding: ints bypassed the known-value gate — the field
+    contract is a string enum, so any other type is an unknown value."""
+    rpc, http = await _serving_client(
+        {"error": "rejected", "state": 834729104928, "code": 17},
+        400,
+    )
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await rpc.read_inbox()
+    finally:
+        await rpc.close()
+        await http.close()
+    message = str(excinfo.value)
+    assert "834729104928" not in message
+    assert "[REDACTED]" in message
+
+
+@pytest.mark.asyncio
+async def test_camelcase_and_plural_credential_keys_are_redacted():
+    """Jeff's finding: accessToken (camelCase) and credentials (plural)
+    slipped past the separator-based secret-key pattern."""
+    rpc, http = await _serving_client(
+        {
+            "error": "auth failed",
+            "accessToken": "FAKE_OPAQUE_ACCESS_SECRET",
+            "credentials": {"value": "FAKE_OPAQUE_CREDENTIAL"},
+        },
+        401,
+    )
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await rpc.sync_mcp(template_id="tpl-1")
+    finally:
+        await rpc.close()
+        await http.close()
+    message = str(excinfo.value)
+    assert "FAKE_OPAQUE_ACCESS_SECRET" not in message
+    assert "FAKE_OPAQUE_CREDENTIAL" not in message
+    assert "[REDACTED]" in message
+    assert "auth failed" in message
+
+
+@pytest.mark.asyncio
 async def test_credentials_are_redacted_from_the_detail_tail():
     """Secret-named keys and secret-shaped values never ride along raw."""
     rpc, http = await _serving_client(
