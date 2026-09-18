@@ -224,6 +224,36 @@ def test_probe_recycles_then_flips_health(registered_manager, saved_states):
     assert ("t", "mcp_unreachable", worker.runtime.error) in saved_states
 
 
+def test_probe_skips_recycle_while_rpc_listener_down(
+    registered_manager, monkeypatch,
+):
+    """WinError-64 incident (2026-09-18): a dead rpc listener makes
+    every worker's hello go missing at once, and recycling then kills
+    MCP subprocesses with connects in flight — the very storm that
+    kills listeners. A daemon-side listener outage must neither strike
+    nor recycle; once the listener answers again, the agent's own
+    transport is back to being the suspect."""
+    mgr = registered_manager(_FakeManager("g1", time.monotonic() - 120))
+    rpc_service.clear_mcp_hello("t")
+    worker = _seed_worker()
+    adapter = _wire(worker, mgr)
+
+    async def _down():
+        return False
+    monkeypatch.setattr(rpc_service, "listener_reachable", _down)
+    _run(worker.probe_mcp_transport("t"))
+    assert adapter.reload_calls == []
+    assert worker._mcp_probe_strikes == 0
+    assert worker.runtime.health == "ok"
+
+    async def _up():
+        return True
+    monkeypatch.setattr(rpc_service, "listener_reachable", _up)
+    _run(worker.probe_mcp_transport("t"))
+    assert adapter.reload_calls == [False]
+    assert worker._mcp_probe_strikes == 1
+
+
 def test_a_per_turn_harness_is_never_wedged_by_this_probe(
     registered_manager, saved_states,
 ):

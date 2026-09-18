@@ -825,9 +825,28 @@ async def start_rpc_service(
         )
         cfg.port = bound_port
     logger.info("rpc-service: listening on %s:%d", cfg.bind_host, cfg.port)
+    global _active_cfg
+    _active_cfg = cfg
     if os.name == "nt":
         _start_listener_watchdog(cfg)
     return runner
+
+
+# The config of the currently running service, for fault-domain checks:
+# a worker seeing no hello must be able to ask whether the listener
+# itself is accepting before it blames (and recycles) its own runtime.
+_active_cfg: RpcServiceConfig | None = None
+
+
+async def listener_reachable() -> bool | None:
+    """Live TCP-probe of the running service's listener.
+
+    ``None`` when the service never started (disabled or bind-window
+    exhausted), where reachability has no meaning."""
+    cfg = _active_cfg
+    if cfg is None:
+        return None
+    return await _probe_listener(cfg.bind_host, cfg.port)
 
 
 # ── Windows listener watchdog ────────────────────────────────────────
@@ -915,7 +934,8 @@ async def _listener_watchdog(cfg: RpcServiceConfig) -> None:
 
 
 async def stop_rpc_service(runner: web.AppRunner | None) -> None:
-    global _watchdog_task, _watchdog_runner
+    global _watchdog_task, _watchdog_runner, _active_cfg
+    _active_cfg = None
     if _watchdog_task is not None:
         _watchdog_task.cancel()
         _watchdog_task = None
