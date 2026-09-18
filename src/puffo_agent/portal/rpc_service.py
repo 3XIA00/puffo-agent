@@ -23,6 +23,7 @@ from ..agent.message_store import (
 )
 from ..agent.message_store_models import LifecycleConflict
 from ..agent.reminder_scheduler import normalize_reminder_timestamp
+from ..tasks import spawn
 from . import host_mcp_handler
 from ._port import bind_tcp_with_fallback
 from .host_mcp_handler import HostMcpContext
@@ -863,7 +864,7 @@ async def listener_reachable() -> bool | None:
 # stops accepting.
 
 _WATCHDOG_INTERVAL_S = 15.0
-_watchdog_task: asyncio.Task | None = None
+_watchdog_task: asyncio.Future | None = None
 _watchdog_runner: web.AppRunner | None = None
 
 
@@ -871,7 +872,7 @@ def _start_listener_watchdog(cfg: RpcServiceConfig) -> None:
     global _watchdog_task
     if _watchdog_task is not None and not _watchdog_task.done():
         return
-    _watchdog_task = asyncio.get_running_loop().create_task(
+    _watchdog_task = spawn(
         _listener_watchdog(cfg), name="rpc_listener_watchdog",
     )
 
