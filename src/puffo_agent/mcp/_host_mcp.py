@@ -4,6 +4,7 @@ the daemon for single-writer semantics; cli-docker reaches the daemon via
 
 from __future__ import annotations
 
+import json
 import logging
 import urllib.parse
 from typing import Any, Optional
@@ -13,6 +14,37 @@ import aiohttp
 from ..portal.local_service_auth import local_service_headers
 
 logger = logging.getLogger(__name__)
+
+_RPC_FAILURE_DETAIL_MAX_CHARS = 500
+
+
+def _rpc_failure_message(route: str, status: int, data: Any) -> str:
+    """Carry the daemon's whole failure body into the raised error.
+
+    A 4xx body is the diagnosis — re-auth needed vs cloud config vs an
+    operator denial — so beyond the ``error`` headline every remaining
+    field rides along as a bounded JSON tail instead of being discarded.
+    """
+    headline = f"rpc {route} failed with status {status}"
+    error = data.get("error") if isinstance(data, dict) else None
+    headlined_error = isinstance(error, str) and bool(error)
+    if headlined_error:
+        headline = f"{headline}: {error}"
+    if isinstance(data, dict):
+        residue: Any = {
+            key: value for key, value in data.items()
+            if (key != "error" or not headlined_error)
+            and value not in (None, "")
+        }
+    else:
+        residue = data
+    if residue in (None, "", {}, []):
+        return headline
+    try:
+        tail = json.dumps(residue, ensure_ascii=False, default=str)
+    except Exception:
+        tail = str(residue)
+    return f"{headline} detail={tail[:_RPC_FAILURE_DETAIL_MAX_CHARS]}"
 
 
 class PuffoRpcClient:
@@ -77,12 +109,8 @@ class PuffoRpcClient:
                         f"(status {resp.status}): {text[:500]}"
                     )
                 if resp.status >= 400:
-                    err = (
-                        data.get("error")
-                        if isinstance(data, dict) else None
-                    )
                     raise RuntimeError(
-                        err or f"rpc {route} failed with status {resp.status}"
+                        _rpc_failure_message(route, resp.status, data)
                     )
                 msg = (
                     data.get("message") if isinstance(data, dict) else None
@@ -123,9 +151,8 @@ class PuffoRpcClient:
                         f"(status {resp.status}): {raw[:500]}"
                     )
                 if resp.status >= 400:
-                    error = data.get("error") if isinstance(data, dict) else None
                     raise RuntimeError(
-                        str(error or f"rpc {route} failed with status {resp.status}")
+                        _rpc_failure_message(route, resp.status, data)
                     )
                 if not isinstance(data, dict):
                     raise RuntimeError(f"rpc {route} returned a non-object result")
@@ -155,9 +182,8 @@ class PuffoRpcClient:
                         f"rpc {route} returned non-JSON (status {resp.status})"
                     ) from exc
                 if resp.status >= 400:
-                    error = data.get("error") if isinstance(data, dict) else None
                     raise RuntimeError(
-                        str(error or f"rpc {route} failed ({resp.status})")
+                        _rpc_failure_message(route, resp.status, data)
                     )
                 if not isinstance(data, dict):
                     raise RuntimeError(f"rpc {route} returned a non-object")
@@ -235,12 +261,9 @@ class PuffoRpcClient:
                         f"(status {resp.status}): {raw[:500]}"
                     )
                 if resp.status >= 400:
-                    error = data.get("error") if isinstance(data, dict) else None
                     raise RuntimeError(
-                        str(
-                            error
-                            or "rpc model-visible-read failed with "
-                            f"status {resp.status}"
+                        _rpc_failure_message(
+                            "model-visible-read", resp.status, data,
                         )
                     )
                 if not isinstance(data, dict) or data.get("state") != "staged":
@@ -273,7 +296,7 @@ class PuffoRpcClient:
                     ) from exc
                 if resp.status >= 400:
                     raise RuntimeError(
-                        str(data.get("error") or f"rpc read-inbox failed ({resp.status})")
+                        _rpc_failure_message("read-inbox", resp.status, data)
                     )
                 if not isinstance(data, dict):
                     raise RuntimeError("rpc read-inbox returned a non-object")
