@@ -8,7 +8,7 @@ import json
 import logging
 import re
 import urllib.parse
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 import aiohttp
 
@@ -120,7 +120,7 @@ class PuffoRpcError(RuntimeError):
         self.error = error
 
 
-def _raise_rpc_failure(route: str, status: int, data: Any) -> None:
+def _raise_rpc_failure(route: str, status: int, data: Any) -> NoReturn:
     error = data.get("error") if isinstance(data, dict) else None
     raise PuffoRpcError(
         _rpc_failure_message(route, status, data),
@@ -128,6 +128,18 @@ def _raise_rpc_failure(route: str, status: int, data: Any) -> None:
         route=route,
         error=error if isinstance(error, str) else "",
     )
+
+
+def _raise_non_json_failure(route: str, status: int, raw: str) -> NoReturn:
+    """A non-JSON body still carries a real HTTP status — an old daemon
+    with no such route answers with aiohttp's default text/plain 404, and
+    the rolling-upgrade probes must still see ``status`` structurally."""
+    message = f"rpc {route} returned non-JSON body (status {status})"
+    if raw:
+        message = f"{message}: {_redact_detail_text(raw)[:500]}"
+    if status >= 400:
+        raise PuffoRpcError(message, status=status, route=route)
+    raise RuntimeError(message)
 
 
 def _redact_detail_text(text: str) -> str:
@@ -237,10 +249,8 @@ class PuffoRpcClient:
                 try:
                     data = await resp.json()
                 except Exception:
-                    text = await resp.text()
-                    raise RuntimeError(
-                        f"rpc {route} returned non-JSON body "
-                        f"(status {resp.status}): {text[:500]}"
+                    _raise_non_json_failure(
+                        route, resp.status, await resp.text(),
                     )
                 if resp.status >= 400:
                     _raise_rpc_failure(route, resp.status, data)
@@ -277,10 +287,8 @@ class PuffoRpcClient:
                 try:
                     data = await resp.json()
                 except Exception:
-                    raw = await resp.text()
-                    raise RuntimeError(
-                        f"rpc {route} returned non-JSON body "
-                        f"(status {resp.status}): {raw[:500]}"
+                    _raise_non_json_failure(
+                        route, resp.status, await resp.text(),
                     )
                 if resp.status >= 400:
                     _raise_rpc_failure(route, resp.status, data)
@@ -307,10 +315,8 @@ class PuffoRpcClient:
             async with session.post(f"{self.base_url}{path}", json=body) as resp:
                 try:
                     data = await resp.json()
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"rpc {route} returned non-JSON (status {resp.status})"
-                    ) from exc
+                except Exception:
+                    _raise_non_json_failure(route, resp.status, "")
                 if resp.status >= 400:
                     _raise_rpc_failure(route, resp.status, data)
                 if not isinstance(data, dict):
@@ -383,10 +389,8 @@ class PuffoRpcClient:
                 try:
                     data = await resp.json()
                 except Exception:
-                    raw = await resp.text()
-                    raise RuntimeError(
-                        "rpc model-visible-read returned non-JSON body "
-                        f"(status {resp.status}): {raw[:500]}"
+                    _raise_non_json_failure(
+                        "model-visible-read", resp.status, await resp.text(),
                     )
                 if resp.status >= 400:
                     _raise_rpc_failure("model-visible-read", resp.status, data)
@@ -414,10 +418,8 @@ class PuffoRpcClient:
             ) as resp:
                 try:
                     data = await resp.json()
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"rpc read-inbox returned non-JSON (status {resp.status})"
-                    ) from exc
+                except Exception:
+                    _raise_non_json_failure("read-inbox", resp.status, "")
                 if resp.status >= 400:
                     _raise_rpc_failure("read-inbox", resp.status, data)
                 if not isinstance(data, dict):

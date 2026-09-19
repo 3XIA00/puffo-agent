@@ -238,6 +238,49 @@ async def test_real_404_still_reads_as_rolling_upgrade():
 
 
 @pytest.mark.asyncio
+async def test_missing_route_default_404_still_reads_as_rolling_upgrade():
+    """Chris's gate finding, upgraded: the *actual* rolling-upgrade case
+    is an old daemon with no such route, which answers with aiohttp's
+    default text/plain 404 — non-JSON. The friendly rewrite must fire."""
+    app = web.Application()  # no routes registered at all
+    http = TestClient(TestServer(app))
+    await http.start_server()
+    rpc = PuffoRpcClient(str(http.make_url("")).rstrip("/"), "agent_a")
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await rpc.mark_covered(covers=["msg-1"])
+    finally:
+        await rpc.close()
+        await http.close()
+    assert "mark_covered is not available" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_non_json_error_body_is_redacted():
+    """A non-JSON error page may still embed a secret-shaped value."""
+    async def handler(request: web.Request) -> web.Response:
+        return web.Response(
+            text="boom bearer sk-abcdefgh12345678", status=500,
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/rpc/{agent_id}/{route}", handler)
+    http = TestClient(TestServer(app))
+    await http.start_server()
+    rpc = PuffoRpcClient(str(http.make_url("")).rstrip("/"), "agent_a")
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await rpc.sync_mcp(template_id="tpl-1")
+    finally:
+        await rpc.close()
+        await http.close()
+    message = str(excinfo.value)
+    assert "sk-abcdefgh12345678" not in message
+    assert "[REDACTED]" in message
+    assert "status 500" in message
+
+
+@pytest.mark.asyncio
 async def test_non_string_code_and_state_are_redacted():
     """Jeff's finding: ints bypassed the known-value gate — the field
     contract is a string enum, so any other type is an unknown value."""
