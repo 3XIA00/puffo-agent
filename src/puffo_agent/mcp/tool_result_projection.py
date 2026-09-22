@@ -32,6 +32,7 @@ ToolResultSurface = Literal["stdio_mcp", "raw"]
 _HELD_INLINE_BUDGET_CHARS = 40_000
 _HELD_CONTENT_CAP_CHARS = 2_000
 _HELD_CONTENT_FLOOR_CHARS = 300
+_HELD_MAX_INLINE_MESSAGES = 40
 _HELD_SPILL_SUBDIR = (".puffo", "held")
 
 
@@ -63,6 +64,27 @@ def _truncate_content_line(line: str, cap: int) -> str:
         return line
     truncated = decoded[:cap] + " …[truncated; full text in the spill file]"
     return prefix + _json(truncated)
+
+
+def _tail_message_blocks(body: str, keep: int) -> tuple[int, str, str]:
+    """Split a message-group body into (omitted_count, preamble, kept tail).
+
+    Newest messages are the reconsideration-relevant ones, so a count
+    overflow drops from the oldest end; the preamble (the ``##`` target
+    label ahead of the first message header) survives either way.
+    """
+    lines = body.split("\n")
+    starts = [
+        index for index, line in enumerate(lines)
+        if line.startswith("[message ")
+    ]
+    if len(starts) <= keep:
+        return 0, "", body
+    preamble = "\n".join(lines[: starts[0]])
+    if keep == 0:
+        return len(starts), preamble, ""
+    cut = starts[len(starts) - keep]
+    return len(starts) - keep, preamble, "\n".join(lines[cut:])
 
 
 def _json(value: Any) -> str:
@@ -367,12 +389,14 @@ def _held_result_lines_compact(
     context_version: int,
     spilled_to: str,
     content_cap: int,
+    max_messages: int | None = None,
 ) -> list[str]:
     """The must-stay-inline projection of an oversized held result.
 
     The agent's own draft echo and the already-seen basis carry no new
     information, so they go to the spill file; the new-context window
-    (bounded per message) and the participation/guidance stay inline.
+    (bounded per message, and per count when ``max_messages`` is set)
+    and the participation/guidance stay inline.
     """
     lines: list[str] = []
     draft = reconsideration.get("draft")
@@ -401,6 +425,14 @@ def _held_result_lines_compact(
         body = "\n".join(
             _truncate_content_line(line, content_cap) for line in body.split("\n")
         )
+    if body and max_messages is not None:
+        omitted, preamble, tail = _tail_message_blocks(body, max_messages)
+        if omitted:
+            notice = (
+                f"[messages_omitted context_version={context_version} "
+                f"omitted_count={omitted} spilled_to={_json(spilled_to)}]"
+            )
+            body = "\n".join(part for part in (preamble, notice, tail) if part)
     raw_count = reconsideration.get("new_channel_context_count")
     returned_count = (
         raw_count
@@ -497,7 +529,15 @@ def format_send_result(result: Mapping[str, Any]) -> str:
         f'note="full held result exceeded the inline budget; the draft '
         f'echo and prior basis are in the spill file"]'
     )
-    for content_cap in (_HELD_CONTENT_CAP_CHARS, _HELD_CONTENT_FLOOR_CHARS):
+    # Tiers tighten until the result provably fits: body caps first, then
+    # message-count caps, ending at a headers-only floor whose size is
+    # bounded by construction — the receipt marker is inline in every tier.
+    for content_cap, max_messages in (
+        (_HELD_CONTENT_CAP_CHARS, None),
+        (_HELD_CONTENT_FLOOR_CHARS, None),
+        (_HELD_CONTENT_FLOOR_CHARS, _HELD_MAX_INLINE_MESSAGES),
+        (_HELD_CONTENT_FLOOR_CHARS, 0),
+    ):
         compact = _assemble_send_result(
             result,
             reconsideration,
@@ -509,6 +549,7 @@ def format_send_result(result: Mapping[str, Any]) -> str:
                 context_version=context_version,
                 spilled_to=spilled_to,
                 content_cap=content_cap,
+                max_messages=max_messages,
             ),
         )
         if len(compact) <= _HELD_INLINE_BUDGET_CHARS:

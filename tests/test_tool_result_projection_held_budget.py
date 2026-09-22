@@ -107,6 +107,25 @@ def test_pathological_flood_still_fits_via_content_floor(spill_workspace):
     assert _MARKER in text
 
 
+def test_message_count_flood_keeps_marker_inline(spill_workspace):
+    """Chris's gate boundary: overflow by COUNT, not per-message length —
+    hundreds of compact messages must not push the receipt out of line."""
+    result = _held_result(
+        draft_chars=1_000, basis_chars=500, message_count=400, body_chars=250
+    )
+    text = format_send_result(result)
+    assert len(text) <= _HELD_INLINE_BUDGET_CHARS
+    assert _MARKER in text
+    assert text.index(_MARKER) < text.index("[end_send_result")
+    # Newest messages stay inline; the oldest are counted and spilled.
+    assert 'message_id="msg_0399"' in text
+    assert 'message_id="msg_0000"' not in text
+    assert "omitted_count=" in text
+    spill_files = list((spill_workspace / ".puffo" / "held").glob("held-*.txt"))
+    assert len(spill_files) == 1
+    assert 'message_id="msg_0000"' in spill_files[0].read_text(encoding="utf-8")
+
+
 def test_non_held_results_are_never_spilled(spill_workspace):
     result = {
         "state": "sent",
