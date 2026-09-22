@@ -126,6 +126,36 @@ def test_message_count_flood_keeps_marker_inline(spill_workspace):
     assert 'message_id="msg_0000"' in spill_files[0].read_text(encoding="utf-8")
 
 
+def test_headers_only_final_tier_is_bounded(spill_workspace):
+    """Last-resort tier: header lines are not content-capped, so messages
+    with enormous headers defeat every message-keeping tier — the final
+    (floor, 0) tier must still fit with zero inline messages, an omitted
+    count, and the receipt marker in place."""
+    body_lines = ["## puffo daemon fix"]
+    for index in range(80):
+        body_lines.append(
+            f'[message context_version=1 seq={100 + index} '
+            f'message_id="msg_{index:04d}" '
+            f'sender_identity="@{"p" * 2_000}-{index}" '
+            f'sender_type="agent" self=false]'
+        )
+        body_lines.append("content=" + json.dumps(f"m{index}"))
+    result = _held_result(
+        draft_chars=1_000, basis_chars=200, message_count=1, body_chars=100
+    )
+    result["reconsideration"]["new_channel_context"] = "\n".join(body_lines)
+    result["reconsideration"]["new_channel_context_count"] = 80
+    text = format_send_result(result)
+    assert len(text) <= _HELD_INLINE_BUDGET_CHARS
+    assert _MARKER in text
+    assert text.index(_MARKER) < text.index("[end_send_result")
+    assert "[message " not in text  # zero inline messages in the final tier
+    assert "omitted_count=80" in text
+    spill_files = list((spill_workspace / ".puffo" / "held").glob("held-*.txt"))
+    assert len(spill_files) == 1
+    assert 'message_id="msg_0079"' in spill_files[0].read_text(encoding="utf-8")
+
+
 def test_non_held_results_are_never_spilled(spill_workspace):
     result = {
         "state": "sent",

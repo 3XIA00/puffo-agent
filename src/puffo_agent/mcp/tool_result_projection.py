@@ -532,6 +532,10 @@ def format_send_result(result: Mapping[str, Any]) -> str:
     # Tiers tighten until the result provably fits: body caps first, then
     # message-count caps, ending at a headers-only floor whose size is
     # bounded by construction — the receipt marker is inline in every tier.
+    # That final bound assumes the non-message inline part (result header,
+    # target/detail lines, participation, guidance, spill pointers, this
+    # note, and the marker) stays well under the budget; those are fixed
+    # platform strings today, so keep them small if they ever grow.
     for content_cap, max_messages in (
         (_HELD_CONTENT_CAP_CHARS, None),
         (_HELD_CONTENT_FLOOR_CHARS, None),
