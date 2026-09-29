@@ -8,6 +8,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Codex agents keep their conversation across daemon upgrades.** Since
+  July the daemon rotated every cli-local Codex session at startup whenever
+  the puffo MCP tool surface had changed — in practice on every release —
+  and did so without logging, so agents silently forgot their standing
+  instructions after each upgrade. Codex loads MCP servers per process and
+  every worker starts a fresh process at boot, so the rotation only
+  discarded context; the daemon now records the fingerprint change and
+  resumes the saved session. A session refresh that does drop a native
+  session, and the session each worker selects at start, are now logged.
+
 - **Claude autonomous turns no longer report a spurious crash after 30
   minutes.** Under message-lifecycle v1 the CLI queues an autonomous turn's
   command itself, so its result frame was discarded as unowned and the turn
