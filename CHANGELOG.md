@@ -27,6 +27,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`puffo-agent agent restart <id>` respawns one agent's worker, and unparks
+  an agent stuck on a recovery gate.** Restarting a single agent previously
+  meant `pause` then `resume`. A quarantined turn additionally parks its
+  agent until an operator accepts that replaying it may repeat external
+  effects, and only the operator's remote client could accept that — a local
+  deployment had to hand-edit `turn_recovery.json`. Restarting a named agent
+  is now that acceptance: it requeues the quarantined turn's messages and
+  says so. An unattended respawn still cannot replay silently, and the
+  command refuses to clear a gate whose provider stop is unconfirmed.
+  `agent show` reports an open gate, and the parked-state diagnostic names
+  the command instead of the internal wire ops.
+
 - **An agent publishes its own credential key at start, so its operator can
   share a credential with it.** The key is derived from the agent's root, so
   nothing is stored for it and re-enrolling a device does not invalidate
