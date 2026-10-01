@@ -162,6 +162,10 @@ def _refresh_flag_is_pending(flag: Path) -> bool:
 # deferral; a run of them means the provider is not reaching the Inbox at all.
 _NO_PROGRESS_TURN_THRESHOLD = 3
 
+# Held before the auth-failed DM: refresh margin 600s vs claude's ~300s
+# rotation, so a turn in that window 401s just before the rotation lands.
+AUTH_FAILED_DM_DELAY_SECONDS = 20.0
+
 # Health values the MCP transport probe may replace with ``mcp_unreachable``.
 # "ok"/"unknown" mean nothing is known to be wrong. The other two are the
 # states a wedged transport actually produces, and both are *symptoms* this
@@ -769,6 +773,11 @@ class Worker:
         if was_ok:
             self._on_auth_failed_enter()
 
+    def end_auth_failed_episode(self) -> None:
+        """Recovery: re-arm the DM and retire any still-pending one."""
+        self._auth_failed_notification_sent = False
+        self._auth_failed_episode += 1
+
     def _on_auth_failed_enter(self) -> None:
         """Fire the operator DM once per auth_failed episode. The flag
         re-arms on auth_failed CLEAR (daemon ``on_refresh_success``) and
@@ -778,9 +787,12 @@ class Worker:
         if getattr(self, "_claude_api_key_mode", False):
             self._api_key_auth_recovery_pending = True
         self._auth_failed_notification_sent = True
+        self._auth_failed_episode += 1
         try:
             spawn(
-                self._notify_operator_of_auth_failed_oauth(),
+                self._notify_operator_of_auth_failed_oauth(
+                    self._auth_failed_episode
+                ),
                 name="notify_operator_of_auth_failed_oauth",
             )
         except Exception as exc:  # noqa: BLE001
@@ -792,11 +804,24 @@ class Worker:
                 exc,
             )
 
-    async def _notify_operator_of_auth_failed_oauth(self) -> None:
+    async def _notify_operator_of_auth_failed_oauth(self, episode: int = 0) -> None:
         """DM the operator the bilingual OAuth-expired recovery copy.
         Re-arms the dedup flag on a transient failure (client not warm,
         or send raised) so the next ENTER retries instead of staying
-        silently gated."""
+        silently gated.
+
+        Dropped when the episode ended during the wait: advice to a human
+        must describe state at send time.
+        """
+        if episode:
+            await asyncio.sleep(AUTH_FAILED_DM_DELAY_SECONDS)
+            if self._auth_failed_episode != episode:
+                logger.info(
+                    "agent %s: auth-failed DM dropped — the credential "
+                    "recovered before it was sent",
+                    self.agent_cfg.id,
+                )
+                return
         client = self._client
         if client is None:
             # Still warming — re-arm so a later ENTER retries.
@@ -1149,7 +1174,7 @@ class Worker:
         )
         if recovering_api_key:
             self._api_key_auth_recovery_pending = False
-            self._auth_failed_notification_sent = False
+            self.end_auth_failed_episode()
         # Transport readiness, refresh and cancellation are not model success.
         if self.runtime.health == "extra_usage_required":
             self.runtime.health = "ok"
@@ -1247,6 +1272,8 @@ class Worker:
         # re-armed on credential refresh-success (daemon
         # on_refresh_success) and on a failed send.
         self._auth_failed_notification_sent = False
+        # auth_failed episode; a pending DM drops itself when it moves on
+        self._auth_failed_episode = 0
         self._drained_notification_sent = False
         self._extra_usage_notification_sent = False
         self._drained_resets_at: int | None = None
