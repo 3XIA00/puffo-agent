@@ -16,6 +16,8 @@ import json
 import pytest
 
 from puffo_agent.agent.harness.driver import (
+    CompactRequest,
+    ContextStatus,
     ContextStatusCapability,
     HarnessEventType,
     RuntimeSpec,
@@ -145,6 +147,87 @@ async def test_step_finish_total_becomes_context_status_and_augments_event():
     await driver.close()
     closed = await driver.context_status()
     assert closed.stale
+
+
+@pytest.mark.asyncio
+async def test_missing_window_rechecks_registry_after_first_turn(monkeypatch):
+    """A first turn can refresh a stale OpenCode model catalog."""
+    proc = _TurnProcess()
+    driver = OpenCodeDriver(lambda command, spec: proc)
+    calls = 0
+
+    async def lookup(_spec):
+        nonlocal calls
+        calls += 1
+        driver._context_window = 200000 if calls == 2 else None
+
+    monkeypatch.setattr(driver, "_resolve_context_window", lookup)
+    await driver.open(RuntimeSpec("/workspace", model="opencode/new-model"))
+    assert calls == 1
+
+    started = asyncio.create_task(driver.start_turn(TurnInput("hi")))
+    proc.feed({"type": "step_start", "sessionID": "ses_ctx",
+               "part": {"messageID": "msg_1"}})
+    await asyncio.wait_for(started, timeout=1)
+    proc.feed(_step_finish(total=9831))
+    proc.exit()
+    proc.eof()
+    async for event in driver.events():
+        if event.type is HarnessEventType.TURN_COMPLETED:
+            break
+
+    first = await driver.context_status()
+    second = await driver.context_status()
+    assert first.used_tokens == 9831
+    assert first.context_window == 200000
+    assert second.context_window == 200000
+    assert calls == 2
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_window_waits_for_compaction_before_recheck(monkeypatch):
+    """The registry child must not collide with an active summarize child."""
+    driver = OpenCodeDriver()
+    calls = 0
+
+    async def lookup(_spec):
+        nonlocal calls
+        assert not driver._temporary_children
+        calls += 1
+        driver._context_window = 200000 if calls == 2 else None
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def summarize(_spec, _session_id):
+        driver._temporary_children["busy"] = None
+        entered.set()
+        try:
+            await release.wait()
+        finally:
+            driver._temporary_children.pop("busy")
+
+    monkeypatch.setattr(driver, "_resolve_context_window", lookup)
+    monkeypatch.setattr(driver, "_summarize_via_serve", summarize)
+    await driver.open(RuntimeSpec("/workspace", model="opencode/new-model"))
+    driver._native_session_id = "ses_ctx"
+    driver._context = ContextStatus(used_tokens=9831, stale=False)
+    await driver.compact(CompactRequest())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    during = await driver.context_status()
+    assert during.used_tokens == 9831
+    assert during.context_window is None
+    assert calls == 1
+    assert not driver._context_window_rechecked
+
+    release.set()
+    await asyncio.wait_for(driver._compact_task, timeout=1)
+    after = await driver.context_status()
+    assert after.context_window == 200000
+    assert calls == 2
+    await driver.close()
 
 
 _MODELS_OUTPUT = """\
