@@ -734,6 +734,27 @@ async def credential_status(ctx: HostMcpContext, *, request_id: str = "") -> str
     return status_line(_ledger(ctx).get(rid))
 
 
+async def list_credentials(ctx: HostMcpContext) -> dict[str, Any]:
+    """Metadata only; projected per field so a blob cannot leak."""
+    credentials = ctx.credentials
+    if credentials is None:
+        raise RuntimeError(
+            "this agent cannot hold credentials (no operator recorded)"
+        )
+    rows = await credentials.held_all()
+    return {
+        "credentials": [
+            {
+                "type": row["type"],
+                "index": row["index"],
+                "version": row["version"],
+                "alias": row["alias"],
+            }
+            for row in rows
+        ]
+    }
+
+
 def _ledger(ctx: HostMcpContext):
     """The process-wide ledger — never a fresh instance. Two in-memory copies of
     one file is what silently dropped Desk's filed credential (2026-10-06): the
@@ -813,6 +834,30 @@ async def gmail_mailbox(
     from . import gmail_mailbox as mailbox
 
     handler = {"search": mailbox.search, "read": mailbox.read, "organize": mailbox.organize}[op]
+    return await handler(ctx.credentials, **kw)
+
+
+async def slack_send(
+    ctx: HostMcpContext, *, channel: str, text: str, thread_ts: str = "", from_account: str = "",
+) -> dict[str, object]:
+    from .slack import send
+
+    return await send(
+        ctx.credentials, channel=channel, text=text, thread_ts=thread_ts,
+        from_account=from_account,
+    )
+
+
+async def connector(
+    ctx: HostMcpContext, *, provider: str, op: str, **kw,
+) -> dict[str, object]:
+    from . import discord, slack
+
+    handler = {
+        "slack": {"search": slack.search, "read": slack.read, "list_channels": slack.list_channels},
+        "discord": {"whoami": discord.whoami, "guilds": discord.guilds,
+                    "guild_member": discord.guild_member, "connections": discord.connections},
+    }[provider][op]
     return await handler(ctx.credentials, **kw)
 
 
