@@ -13,8 +13,12 @@ import base64
 import binascii
 import json
 import logging
+import os
+import re
+import tempfile
 import urllib.parse
 from email import message_from_bytes
+from pathlib import Path
 from email.policy import default as default_policy
 
 import aiohttp
@@ -29,6 +33,11 @@ API = "https://gmail.googleapis.com/gmail/v1/users/me"
 # Past this the body would bury the agent's own context; the cut is flagged.
 MAX_BODY_CHARS = 20_000
 MAX_RESULTS = 50
+# Gmail per-message cap.
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+# batchModify id cap.
+MAX_BATCH_IDS = 1000
+ATTACHMENT_DIR = "gmail-attachments"
 
 # The user's words, mapped to the label edit Gmail wants. No delete: the
 # scope does not grant one.
@@ -51,6 +60,7 @@ async def search(
     *,
     query: str = "",
     limit: int = 10,
+    page_token: str = "",
     from_account: str = "",
     transport: Transport | None = None,
     api: str = API,
@@ -61,6 +71,8 @@ async def search(
     params = {"maxResults": str(limit)}
     if query:
         params["q"] = query
+    if page_token:
+        params["pageToken"] = page_token
     listed = await _get(account, f"{api}/messages", params, transport)
     ids = [m["id"] for m in (listed.get("messages") or []) if isinstance(m.get("id"), str)]
     messages = []
@@ -72,7 +84,11 @@ async def search(
         )
         messages.append(_summary(full))
     logger.info("gmail search: %d result(s)", len(messages))
-    return {"messages": messages, "count": len(messages)}
+    return {
+        "messages": messages,
+        "count": len(messages),
+        "next_page_token": listed.get("nextPageToken") or "",
+    }
 
 
 async def read(
@@ -171,6 +187,251 @@ async def organize(
             "bad_request", f"{action!r} is not an action; one of: " + ", ".join(ACTIONS)
         )
     return await _modify(credentials, message_id, action, from_account, transport, api)
+
+
+# ── labels ─────────────────────────────────────────────────────────
+
+
+async def list_labels(
+    credentials: AgentCredentials | None,
+    *,
+    from_account: str = "",
+    transport: Transport | None = None,
+    api: str = API,
+) -> dict:
+    account = await _account(credentials, from_account)
+    labels = await _labels(account, transport, api)
+    return {"labels": labels, "count": len(labels)}
+
+
+async def create_label(
+    credentials: AgentCredentials | None,
+    *,
+    name: str,
+    from_account: str = "",
+    transport: Transport | None = None,
+    api: str = API,
+) -> dict:
+    """Idempotent: an existing label is returned."""
+    name = name.strip()
+    if not name:
+        raise GmailSendError("bad_request", "name is required")
+    account = await _account(credentials, from_account)
+    try:
+        data = await _post(
+            account, f"{api}/labels",
+            {"name": name, "labelListVisibility": "labelShow",
+             "messageListVisibility": "show"},
+            transport,
+        )
+    except GmailSendError as exc:
+        if exc.code != "gmail_409":
+            raise
+        existing = _find_label(await _labels(account, transport, api), name)
+        if existing is None:
+            raise
+        logger.info("gmail create_label: exists %s", existing["id"])
+        return {"status": "exists", **existing}
+    logger.info("gmail create_label: %s", data.get("id", ""))
+    return {"status": "created", "id": data.get("id", ""), "name": data.get("name", name),
+            "type": data.get("type", "user")}
+
+
+async def label(
+    credentials: AgentCredentials | None,
+    *,
+    message_ids: list,
+    add: list | None = None,
+    remove: list | None = None,
+    from_account: str = "",
+    transport: Transport | None = None,
+    api: str = API,
+) -> dict:
+    """Names or ids; an unknown name is refused, never created."""
+    ids = _strings(message_ids, "message_ids")
+    add_names, remove_names = _strings(add or [], "add"), _strings(remove or [], "remove")
+    if not ids:
+        raise GmailSendError("bad_request", "message_ids must name at least one message")
+    if len(ids) > MAX_BATCH_IDS:
+        raise GmailSendError("bad_request", f"at most {MAX_BATCH_IDS} messages per call")
+    if not add_names and not remove_names:
+        raise GmailSendError("bad_request", "add or remove must name at least one label")
+    account = await _account(credentials, from_account)
+    known = await _labels(account, transport, api)
+    add_ids, remove_ids = _label_ids(known, add_names), _label_ids(known, remove_names)
+    await _post(
+        account, f"{api}/messages/batchModify",
+        {"ids": ids, "addLabelIds": add_ids, "removeLabelIds": remove_ids}, transport,
+    )
+    logger.info("gmail label: %d message(s), +%d -%d", len(ids), len(add_ids), len(remove_ids))
+    return {"status": "done", "count": len(ids), "added": add_ids, "removed": remove_ids}
+
+
+async def _labels(account, transport, api: str) -> list[dict]:
+    data = await _get(account, f"{api}/labels", {}, transport)
+    return [
+        {"id": item["id"], "name": item.get("name", item["id"]),
+         "type": item.get("type", "user")}
+        for item in data.get("labels") or []
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    ]
+
+
+def _find_label(labels: list[dict], wanted: str) -> dict | None:
+    """Id first, then case-insensitive name (as Gmail)."""
+    for item in labels:
+        if item["id"] == wanted:
+            return item
+    folded = wanted.casefold()
+    for item in labels:
+        if item["name"].casefold() == folded:
+            return item
+    return None
+
+
+def _label_ids(labels: list[dict], wanted: list[str]) -> list[str]:
+    ids, missing = [], []
+    for name in wanted:
+        found = _find_label(labels, name)
+        if found is None:
+            missing.append(name)
+        else:
+            ids.append(found["id"])
+    if missing:
+        raise GmailSendError(
+            "unknown_label",
+            "no such label: " + ", ".join(repr(m) for m in missing)
+            + ". Create it first with gmail_create_label.",
+        )
+    return ids
+
+
+def _strings(value, field: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise GmailSendError("bad_request", f"{field} must be a list of strings")
+    return [v.strip() for v in value if v.strip()]
+
+
+# ── drafts ─────────────────────────────────────────────────────────
+
+
+async def list_drafts(
+    credentials: AgentCredentials | None,
+    *,
+    limit: int = 10,
+    page_token: str = "",
+    from_account: str = "",
+    transport: Transport | None = None,
+    api: str = API,
+) -> dict:
+    account = await _account(credentials, from_account)
+    params = {"maxResults": str(max(1, min(int(limit or 10), MAX_RESULTS)))}
+    if page_token:
+        params["pageToken"] = page_token
+    listed = await _get(account, f"{api}/drafts", params, transport)
+    drafts = []
+    for item in listed.get("drafts") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        full = await _get(
+            account, f"{api}/drafts/{urllib.parse.quote(item['id'], safe='')}",
+            {"format": "metadata"}, transport,
+        )
+        drafts.append({"draft_id": item["id"], **_summary(full.get("message") or {})})
+    logger.info("gmail list_drafts: %d", len(drafts))
+    return {
+        "drafts": drafts,
+        "count": len(drafts),
+        "next_page_token": listed.get("nextPageToken") or "",
+    }
+
+
+# ── attachments ────────────────────────────────────────────────────
+
+
+async def get_attachment(
+    credentials: AgentCredentials | None,
+    *,
+    message_id: str,
+    filename: str,
+    workspace: Path | None,
+    from_account: str = "",
+    transport: Transport | None = None,
+    api: str = API,
+) -> dict:
+    """Save into the workspace; overwrites, so retry-safe."""
+    message_id, filename = message_id.strip(), filename.strip()
+    if not message_id or not filename:
+        raise GmailSendError("bad_request", "message_id and filename are required")
+    if workspace is None:
+        raise GmailSendError("no_workspace", "this agent has no workspace to save into")
+    account = await _account(credentials, from_account)
+    quoted = urllib.parse.quote(message_id, safe="")
+    full = await _get(account, f"{api}/messages/{quoted}", {"format": "full"}, transport)
+    parts = [p for p in _parts(full.get("payload") or {}) if p.get("filename")]
+    matches = [p for p in parts if p["filename"] == filename]
+    if not matches:
+        raise GmailSendError(
+            "unknown_attachment",
+            f"{filename!r} is not attached; attached: "
+            + (", ".join(repr(p["filename"]) for p in parts) or "nothing"),
+        )
+    part = matches[0]
+    body = part.get("body") or {}
+    if int(body.get("size") or 0) > MAX_ATTACHMENT_BYTES:
+        raise GmailSendError("too_large", f"{filename!r} is larger than 25 MiB")
+    if isinstance(body.get("data"), str):
+        data = _b64(body["data"])
+    elif isinstance(body.get("attachmentId"), str):
+        fetched = await _get(
+            account,
+            f"{api}/messages/{quoted}/attachments/"
+            f"{urllib.parse.quote(body['attachmentId'], safe='')}",
+            {}, transport,
+        )
+        if not isinstance(fetched.get("data"), str):
+            raise GmailSendError("bad_reply", "Gmail returned the attachment without its data")
+        data = _b64(fetched["data"])
+    else:
+        raise GmailSendError("bad_reply", "Gmail returned the attachment without its data")
+    saved = _save(Path(workspace), message_id, filename, data)
+    logger.info("gmail get_attachment: %s (%d bytes)", message_id, len(data))
+    return {"status": "saved", "path": saved, "size": len(data),
+            "mime_type": part.get("mimeType", "")}
+
+
+def _parts(payload: dict):
+    yield payload
+    for child in payload.get("parts") or []:
+        if isinstance(child, dict):
+            yield from _parts(child)
+
+
+def _safe_name(name: str, fallback: str) -> str:
+    """Bare file name: no dirs, control chars or leading dots."""
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip().lstrip(".")
+    return name[:200] or fallback
+
+
+def _save(workspace: Path, message_id: str, filename: str, data: bytes) -> str:
+    """Write under ``gmail-attachments/<message>/``; refuse workspace escapes."""
+    root = workspace.resolve()
+    folder = root / ATTACHMENT_DIR / _safe_name(message_id, "message")
+    if not folder.resolve().is_relative_to(root):
+        raise GmailSendError("bad_request", "the attachment folder escapes the workspace")
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / _safe_name(filename, "attachment")
+    # temp + rename: replaces a symlink at target, never writes through it
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".part-")
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+        os.replace(tmp, target)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return str(target.relative_to(root))
 
 
 # ── the shared request path ────────────────────────────────────────
