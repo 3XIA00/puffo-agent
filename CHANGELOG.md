@@ -18,7 +18,7 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   default; a lost answer to a write is reported `unknown` — it may have been
   applied — and never retried. Credentials never leave the daemon, and 403/404
   carry their own reasons (`insufficient_capability` vs `not_shared_or_missing`)
-  without a pointless token refresh.
+  without a pointless token refresh. (#470)
 
 ## [2.1.0] - 2026-10-13
 
