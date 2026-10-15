@@ -222,8 +222,11 @@ async def test_create_page_without_content_sends_no_children_and_needs_parent_an
 @pytest.mark.asyncio
 @pytest.mark.parametrize("answer, kind", [
     (aiohttp.ServerDisconnectedError(), "unknown"), ((503, {}), "unknown"),
-    ((429, {}), "error"), ((200, b"<html>"), "error")],
-    ids=["disconnect", "5xx", "429", "2xx-not-json"])
+    ((429, {}), "error"),
+    # a 2xx the write surely happened for, but an unreadable body: `unknown`,
+    # NOT error — error would mean "not created" and the agent would retry.
+    ((200, b"<html>"), "unknown")],
+    ids=["disconnect", "5xx", "429", "2xx-unreadable"])
 async def test_create_page_lost_answer_is_unknown_and_never_reposted(answer, kind):
     api = Scripted(answer)
     if kind == "error":

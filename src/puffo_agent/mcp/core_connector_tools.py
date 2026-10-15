@@ -10,7 +10,12 @@ def register_connector_tools(mcp: FastMCP, cfg: Any) -> None:
     if getattr(cfg, "rpc_client", None) is None:
         return
     rpc = cfg.rpc_client
+    _register_slack(mcp, rpc)
+    _register_discord(mcp, rpc)
+    _register_notion(mcp, rpc)
 
+
+def _register_slack(mcp: FastMCP, rpc: Any) -> None:
     @mcp.tool()
     async def slack_send(
         channel: str, text: str, thread_ts: str = "", from_account: str = "",
@@ -68,6 +73,8 @@ def register_connector_tools(mcp: FastMCP, cfg: Any) -> None:
             "slack", "list_channels", types=types, limit=limit, from_account=from_account,
         )
 
+
+def _register_discord(mcp: FastMCP, rpc: Any) -> None:
     @mcp.tool()
     async def discord_whoami(from_account: str = "") -> dict[str, Any]:
         """The connected Discord user: id, username, email.
@@ -96,6 +103,8 @@ def register_connector_tools(mcp: FastMCP, cfg: Any) -> None:
         """Third-party accounts (GitHub, Steam, …) linked to the Discord user."""
         return await rpc.connector("discord", "connections", from_account=from_account)
 
+
+def _register_notion(mcp: FastMCP, rpc: Any) -> None:
     @mcp.tool()
     async def notion_search(
         query: str = "", limit: int = 10, page_token: str = "", from_account: str = "",

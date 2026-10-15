@@ -136,6 +136,11 @@ async def create_page(
         return _unknown(str(exc))
     if status >= 500:
         return _unknown(f"Notion answered {status}")
+    if 200 <= status < 300 and not isinstance(data, dict):
+        # The write did happen; an unreadable 2xx body must not surface as an
+        # error — the shell contract reads "error" as "not applied -> retry",
+        # which would create the page twice.
+        return _unknown("Notion answered 2xx with an unreadable body")
     page = _ok(status, data, retryable=False)
     logger.info("notion create_page: %s", page.get("id", ""))
     return {"page_id": str(page.get("id") or ""), "url": str(page.get("url") or "")}
@@ -189,6 +194,8 @@ async def _write(account: Account, method: str, url: str, payload: dict, transpo
         return _unknown(str(exc))
     if status >= 500:
         return _unknown(f"Notion answered {status}")
+    if 200 <= status < 300 and not isinstance(data, dict):
+        return _unknown("Notion answered 2xx with an unreadable body")
     _ok(status, data, retryable=False)
     return None
 
@@ -216,7 +223,7 @@ def _ok(status: int, data: Any, *, retryable: bool = True) -> dict:
         if retryable:
             _fail("rate_limited")
             raise ConnectorLostAnswer("Notion rate-limited the request; try again shortly")
-        raise _refusal("rate_limited", "Notion rate-limited the request; nothing was applied")
+        raise _refusal("rate_limited", "Notion rate-limited the request; this step was not applied")
     if status >= 500:
         _fail("no_answer")
         raise ConnectorLostAnswer(f"Notion answered {status}")
