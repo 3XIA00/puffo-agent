@@ -14,7 +14,9 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   summary, and one level of block text, cut and flagged `content_truncated`
   when long), `notion_create_page` (a child page under a parent page, with the
   body as one paragraph per line) and `notion_update_page` (rename and/or
-  append paragraphs). A missing source field projects empty, never a fabricated
+  append paragraphs). Writes are as honest as reads: a body past Notion's
+  one-request block ceiling is cut and flagged `content_truncated` rather than
+  dropped silently. A missing source field projects empty, never a fabricated
   default; a lost answer to a write is reported `unknown` — it may have been
   applied — and never retried. Credentials never leave the daemon, and 403/404
   carry their own reasons (`insufficient_capability` vs `not_shared_or_missing`)

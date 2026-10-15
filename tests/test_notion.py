@@ -197,7 +197,7 @@ async def test_create_page_builds_a_page_parent_title_and_paragraphs():
     api = Scripted((200, {"id": "new1", "url": "https://notion.so/new1"}))
     out = await notion.create_page(wallet(), parent_id=" par1 ", title=" Plan ",
                                    content="first line\n\nsecond line", transport=api, api=API)
-    assert out == {"page_id": "new1", "url": "https://notion.so/new1"}
+    assert out == {"page_id": "new1", "url": "https://notion.so/new1", "content_truncated": False}
     (method, url, headers, body), = api.requests
     assert (method, url) == ("POST", f"{API}/pages") and headers["notion-version"] == VERSION
     assert body["parent"] == {"page_id": "par1"}
@@ -244,7 +244,7 @@ async def test_update_page_sets_title_then_appends_in_order():
                        "/blocks/pg1/children": (200, {"results": []})})
     out = await notion.update_page(wallet(), page_id="pg1", title="New", append_content="more",
                                    transport=api, api=API)
-    assert out == {"ok": True, "page_id": "pg1"}
+    assert out == {"ok": True, "page_id": "pg1", "content_truncated": False}
     assert [(r[0], r[1]) for r in api.requests] == [
         ("PATCH", f"{API}/pages/pg1"), ("PATCH", f"{API}/blocks/pg1/children")]
     assert api.requests[0][3] == {
@@ -277,6 +277,32 @@ async def test_update_page_lost_answer_on_append_is_unknown():
 
 
 @pytest.mark.asyncio
+async def test_a_body_over_the_block_ceiling_is_cut_and_flagged_not_dropped_silently():
+    """Write honesty isomorphic to read_page: a body past Notion's one-request
+    block ceiling is truncated and SAID SO, never silently swallowed."""
+    over = "\n".join(f"line {i}" for i in range(notion.MAX_CHILD_BLOCKS + 25))
+    under = "\n".join(f"line {i}" for i in range(notion.MAX_CHILD_BLOCKS))
+
+    api = Scripted((200, {"id": "n1", "url": "u1"}))
+    out = await notion.create_page(wallet(), parent_id="p", title="T", content=over,
+                                   transport=api, api=API)
+    assert out["content_truncated"] is True
+    assert len(api.requests[0][3]["children"]) == notion.MAX_CHILD_BLOCKS
+
+    at_limit = Scripted((200, {"id": "n2", "url": "u2"}))
+    out = await notion.create_page(wallet(), parent_id="p", title="T", content=under,
+                                   transport=at_limit, api=API)
+    assert out["content_truncated"] is False
+    assert len(at_limit.requests[0][3]["children"]) == notion.MAX_CHILD_BLOCKS
+
+    appended = Routed(API, {"/blocks/pg1/children": (200, {"results": []})})
+    out = await notion.update_page(wallet(), page_id="pg1", append_content=over,
+                                   transport=appended, api=API)
+    assert out["content_truncated"] is True
+    assert len(appended.requests[0][3]["children"]) == notion.MAX_CHILD_BLOCKS
+
+
+@pytest.mark.asyncio
 async def test_multi_account_held_empty_one_many_and_from_account_hit_miss():
     ok = (200, {"results": []})
     with pytest.raises(ConnectorError) as exc:
@@ -295,9 +321,15 @@ async def test_multi_account_held_empty_one_many_and_from_account_hit_miss():
 
 @pytest.mark.asyncio
 async def test_the_token_never_reaches_the_projection_log_or_error(caplog):
-    """§5.7: an executable scrub sentinel, with a positive control that bites."""
+    """§5.7 scrub sentinel with teeth. The token is planted into NON-projected
+    response-body fields: a projection that echoed the raw body (rather than
+    selecting fields) would leak it, so the forward assert is not vacuous. Plus
+    the shared-call scrub (logs, error text) and a positive control that bites."""
     caplog.set_level(logging.DEBUG)
-    out = await notion.search(wallet(), transport=Routed(API, {"/search": (200, {"results": [PAGE_HIT]})}),
+    bugged = {**PAGE_HIT, "secret_echo": TOKEN, "properties": {
+        **PAGE_HIT["properties"],
+        "Token": {"type": "rich_text", "rich_text": [{"plain_text": FRESH}]}}}
+    out = await notion.search(wallet(), transport=Routed(API, {"/search": (200, {"results": [bugged]})}),
                               api=API)
     with pytest.raises(ConnectorError) as exc:
         await notion.search(wallet(),

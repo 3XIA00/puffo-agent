@@ -135,7 +135,9 @@ def _register_notion(mcp: FastMCP, rpc: Any) -> None:
         """Create a page under a parent page.
 
         ``parent_id`` is a page id from ``notion_search`` (the integration must
-        be shared on it). ``content`` becomes paragraphs, one per line.
+        be shared on it). ``content`` becomes paragraphs, one per line. A body
+        over Notion's one-request block ceiling is cut and flagged
+        ``content_truncated`` — the rest is not written.
 
         **"unknown" means it may have been created: check before posting it
         again.** An error means it was not.
@@ -152,7 +154,8 @@ def _register_notion(mcp: FastMCP, rpc: Any) -> None:
         """Rename a page and/or append paragraphs to it.
 
         Pass ``title`` to rename, ``append_content`` to add paragraphs (one per
-        line), or both.
+        line), or both. Appended text over Notion's one-request block ceiling is
+        cut and flagged ``content_truncated`` — the rest is not written.
 
         **"unknown" means it may have been applied: check before trying again.**
         """

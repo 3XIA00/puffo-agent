@@ -124,7 +124,7 @@ async def create_page(
         "parent": {"page_id": parent_id.strip()},
         "properties": {"title": {"title": _text_rich(title.strip())}},
     }
-    children = _paragraphs(content)
+    children, truncated = _child_blocks(content)
     if children:
         payload["children"] = children
     try:
@@ -143,7 +143,11 @@ async def create_page(
         return _unknown("Notion answered 2xx with an unreadable body")
     page = _ok(status, data, retryable=False)
     logger.info("notion create_page: %s", page.get("id", ""))
-    return {"page_id": str(page.get("id") or ""), "url": str(page.get("url") or "")}
+    return {
+        "page_id": str(page.get("id") or ""),
+        "url": str(page.get("url") or ""),
+        "content_truncated": truncated,
+    }
 
 
 async def update_page(
@@ -164,6 +168,7 @@ async def update_page(
         raise ConnectorError("bad_request", "nothing to update: pass title or append_content")
     account = await pick_account(CONNECTOR, credentials, from_account)
     pid = page_id.strip()
+    truncated = False
     if title.strip():
         lost = await _write(
             account, "PATCH", f"{api}/pages/{_quote(pid)}",
@@ -172,14 +177,15 @@ async def update_page(
         if lost is not None:
             return lost
     if append_content.strip():
+        blocks, truncated = _child_blocks(append_content)
         lost = await _write(
             account, "PATCH", f"{api}/blocks/{_quote(pid)}/children",
-            {"children": _paragraphs(append_content)}, transport,
+            {"children": blocks}, transport,
         )
         if lost is not None:
             return lost
     logger.info("notion update_page: %s", pid)
-    return {"ok": True, "page_id": pid}
+    return {"ok": True, "page_id": pid, "content_truncated": truncated}
 
 
 async def _write(account: Account, method: str, url: str, payload: dict, transport) -> dict | None:
@@ -299,7 +305,17 @@ def _paragraphs(content: str) -> list[dict]:
                 "type": "paragraph",
                 "paragraph": {"rich_text": [{"type": "text", "text": {"content": chunk}}]},
             })
-    return blocks[:MAX_CHILD_BLOCKS]
+    return blocks
+
+
+def _child_blocks(content: str) -> tuple[list[dict], bool]:
+    """Paragraph blocks for a write body, and whether the list was cut at
+    Notion's one-page ceiling. Writes stay as honest as read_page: the caller
+    surfaces the flag instead of dropping blocks silently."""
+    blocks = _paragraphs(content)
+    if len(blocks) > MAX_CHILD_BLOCKS:
+        return blocks[:MAX_CHILD_BLOCKS], True
+    return blocks, False
 
 
 def _rich_text(items: Any) -> str:
