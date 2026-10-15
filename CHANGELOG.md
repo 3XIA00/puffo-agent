@@ -21,6 +21,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   applied — and never retried. Credentials never leave the daemon, and 403/404
   carry their own reasons (`insufficient_capability` vs `not_shared_or_missing`)
   without a pointless token refresh. (#470)
+- **Google Calendar for agents.** Five native tools over a connected calendar:
+  `calendar_list_events` (upcoming events, recurring ones expanded, paged),
+  `calendar_list_calendars` (the calendars the account can see), and the
+  writes `calendar_create_event` / `calendar_update_event` /
+  `calendar_delete_event`. Every write is silent — fixed `sendUpdates=none`,
+  no attendees — so an agent never sends an invite or notification (that is
+  `gmail_send`'s job); opening attendees is a separate v2. A deleted event that
+  is already gone still reports success (idempotent). A lost answer to a write
+  is reported `unknown` and never retried. `all_day` reads as a plain bool but
+  crosses the daemon boundary string-encoded, parsed strictly on the far side.
+  A 403 keeps its reason apart: `insufficient_scope` (reconnect and grant
+  access) vs `api_not_enabled` (enable the Calendar API in the Google console),
+  never conflated, and neither triggers a pointless token refresh.
 
 ## [2.1.0] - 2026-10-13
 

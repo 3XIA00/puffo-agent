@@ -13,6 +13,7 @@ def register_connector_tools(mcp: FastMCP, cfg: Any) -> None:
     _register_slack(mcp, rpc)
     _register_discord(mcp, rpc)
     _register_notion(mcp, rpc)
+    _register_calendar(mcp, rpc)
 
 
 def _register_slack(mcp: FastMCP, rpc: Any) -> None:
@@ -162,4 +163,87 @@ def _register_notion(mcp: FastMCP, rpc: Any) -> None:
         return await rpc.connector(
             "notion", "update_page", page_id=page_id, title=title,
             append_content=append_content, from_account=from_account,
+        )
+
+
+def _register_calendar(mcp: FastMCP, rpc: Any) -> None:
+    @mcp.tool()
+    async def calendar_list_events(
+        time_min: str = "", time_max: str = "", query: str = "", limit: int = 10,
+        calendar_id: str = "primary", from_account: str = "",
+    ) -> dict[str, Any]:
+        """Events on a calendar, soonest first, each recurring event expanded to
+        its individual occurrences.
+
+        ``time_min``/``time_max`` are RFC-3339 timestamps bounding the window;
+        ``query`` free-text matches an event. ``limit`` 1..2500 (default 10).
+        ``calendar_id`` from ``calendar_list_calendars`` (``primary`` = the
+        account's own).
+        """
+        return await rpc.connector(
+            "googlecalendar", "list_events", time_min=time_min, time_max=time_max,
+            query=query, limit=limit, calendar_id=calendar_id, from_account=from_account,
+        )
+
+    @mcp.tool()
+    async def calendar_list_calendars(from_account: str = "") -> dict[str, Any]:
+        """Calendars the connected account can see: id, name, whether it is the
+        primary one, and the account's access role on it."""
+        return await rpc.connector("googlecalendar", "list_calendars", from_account=from_account)
+
+    @mcp.tool()
+    async def calendar_create_event(
+        summary: str, start: str, end: str, description: str = "", all_day: bool = False,
+        calendar_id: str = "primary", from_account: str = "",
+    ) -> dict[str, Any]:
+        """Create an event. Nobody is invited and no notification is sent
+        (attendees are out of scope for now).
+
+        ``start``/``end`` are RFC-3339 timestamps for a timed event; for an
+        all-day event pass ``all_day=true`` with ``start``/``end`` as
+        ``YYYY-MM-DD`` dates (``end`` is exclusive).
+
+        **"unknown" means it may have been created: check the calendar before
+        creating it again.** An error means it was not.
+        """
+        # all_day is a bool here (FastMCP supports it), but the connector RPC body
+        # rejects every bool value (rpc_service._check_op_body), so encode it as a
+        # string the provider parses strictly.
+        return await rpc.connector(
+            "googlecalendar", "create_event", summary=summary, start=start, end=end,
+            description=description, all_day="true" if all_day else "false",
+            calendar_id=calendar_id, from_account=from_account,
+        )
+
+    @mcp.tool()
+    async def calendar_update_event(
+        event_id: str, summary: str = "", start: str = "", end: str = "",
+        description: str = "", calendar_id: str = "primary", from_account: str = "",
+    ) -> dict[str, Any]:
+        """Change an event's summary, time, and/or description — pass only the
+        fields to change. No notification is sent.
+
+        ``start``/``end`` are RFC-3339 timestamps; ``event_id`` from
+        ``calendar_list_events``.
+
+        **"unknown" means it may have been applied: check before trying again.**
+        """
+        return await rpc.connector(
+            "googlecalendar", "update_event", event_id=event_id, summary=summary,
+            start=start, end=end, description=description, calendar_id=calendar_id,
+            from_account=from_account,
+        )
+
+    @mcp.tool()
+    async def calendar_delete_event(
+        event_id: str, calendar_id: str = "primary", from_account: str = "",
+    ) -> dict[str, Any]:
+        """Delete an event. Deleting an already-gone event is a success. No
+        notification is sent.
+
+        **"unknown" means it may have been deleted: check before trying again.**
+        """
+        return await rpc.connector(
+            "googlecalendar", "delete_event", event_id=event_id, calendar_id=calendar_id,
+            from_account=from_account,
         )

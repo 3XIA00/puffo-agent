@@ -14,6 +14,8 @@ EXPECTED = {
     "slack_send", "slack_search", "slack_read", "slack_list_channels",
     "discord_whoami", "discord_guilds", "discord_guild_member", "discord_connections",
     "notion_search", "notion_read_page", "notion_create_page", "notion_update_page",
+    "calendar_list_events", "calendar_list_calendars", "calendar_create_event",
+    "calendar_update_event", "calendar_delete_event",
 }
 
 
