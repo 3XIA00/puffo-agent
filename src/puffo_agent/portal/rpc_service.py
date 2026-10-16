@@ -1089,10 +1089,7 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
         "/v1/rpc/{agent_id}/googlecalendar",
         connector_route("googlecalendar"),
     )
-    app.router.add_post(
-        "/v1/rpc/{agent_id}/zoom",
-        connector_route("zoom"),
-    )
+    app.router.add_post("/v1/rpc/{agent_id}/zoom", connector_route("zoom"))
     app.router.add_post(
         "/v1/rpc/{agent_id}/mark-covered",
         mark_covered_route,
