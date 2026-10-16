@@ -1,7 +1,8 @@
-"""Zoom Phase 1 (read-only) against a fake Zoom: projection both ways, the one
-refresh, the 4711 insufficient-scope split that never refreshes, and the
-no-leak sentinel. Recordings tools land in a later commit (projection pending
-the Design Engineer's pin)."""
+"""Zoom Phase 1 (read-only) against a fake Zoom: projection both ways for all
+four read tools, the one refresh, the 4711 insufficient-scope split that never
+refreshes, pagination consumed (not merely advertised), and the no-leak
+sentinels — including the recordings scrub that drops the bearer links / PII
+while keeping the resource handles."""
 
 import json
 import logging
@@ -166,10 +167,22 @@ async def test_get_meeting_recordings_lists_file_metadata_without_download_links
 @pytest.mark.asyncio
 async def test_recordings_never_leak_links_or_pii_but_keep_the_handles(caplog):
     """§5.7 for recordings (测试姬 ②): the bearer links / password / host_email
-    are planted into the raw bodies; a projection that echoed them (or a log /
-    error that embedded them) would leak. The resource handles meeting_id / uuid /
+    are planted into the raw bodies; a projection that echoed them (or a log that
+    embedded the raw body) would leak. The resource handles meeting_id / uuid /
     recording_id are the opposite — they MUST survive (they are the next call's
-    input), so this also asserts they are kept."""
+    input), so this also asserts they are kept.
+
+    Projection ∧ log are real detectors, each with a positive control. The error
+    face is empty by construction, NOT a detector — the assertion is KEPT as a
+    documented latent tripwire (not deleted): empty today, it only gains teeth if
+    a future change breaks the property below. Construction attempt (per
+    [[pinned-observable-makes-assertion-empty]], 测试姬 ii, object-verified by Bob
+    §5 + 测试姬): a recording payload can reach a raised ConnectorError only through
+    its message, but every raise message is sourced from static text or
+    ``_error_detail(data)`` — which reads solely the error body's own
+    ``{code, message[:200]}``. Recording payloads live in the 2xx success body
+    (``return data``, before any error path) and ``_error_detail`` never reads
+    them, so today no input routes a recording field into str(exc)."""
     caplog.set_level(logging.DEBUG)
     meeting = {"id": 111, "uuid": "u1", "topic": "Wk1", "host_email": TOKEN, "password": FRESH}
     rfile = {"id": "rf1", "file_type": "MP4", "download_url": TOKEN, "play_url": FRESH}
@@ -184,14 +197,14 @@ async def test_recordings_never_leak_links_or_pii_but_keep_the_handles(caplog):
         await zoom.list_recordings(wallet(), from_date="a", to_date="b",
                                    transport=Scripted((404, {"code": 3001, "message": "x"})), api=API)
     for secret in (TOKEN, FRESH):
-        assert _clean(out_list, secret) and _clean(out_files, secret)
-        assert secret not in str(exc.value)
-        assert secret not in caplog.text
+        assert _clean(out_list, secret) and _clean(out_files, secret)  # projection scrub (real)
+        assert secret not in caplog.text                               # log scrub (real)
+        assert secret not in str(exc.value)  # error face: by-construction-empty, kept as tripwire
     # the legitimate handles survive (not scrubbed) — the positive half
     assert out_list["recordings"][0]["meeting_id"] == "111"
     assert out_list["recordings"][0]["uuid"] == "u1"
     assert out_files["recording_files"][0]["recording_id"] == "rf1"
-    assert not _clean({"leaked": TOKEN}, TOKEN)  # the sentinel is not vacuous
+    assert not _clean({"leaked": TOKEN}, TOKEN)  # the sentinels are not vacuous
 
 
 @pytest.mark.asyncio
