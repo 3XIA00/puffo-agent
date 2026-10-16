@@ -34,6 +34,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   A 403 keeps its reason apart: `insufficient_scope` (reconnect and grant
   access) vs `api_not_enabled` (enable the Calendar API in the Google console),
   never conflated, and neither triggers a pointless token refresh.
+- **Zoom for agents (read-only, phase 1).** Four native tools over a connected
+  Zoom account: `zoom_whoami` (the connected user — display name, email, type,
+  PMI, timezone), `zoom_get_meeting` (a meeting's topic, start, duration, join
+  URL), `zoom_list_recordings` (cloud recordings in a date window, paged with
+  `page_token`/`next_page_token`) and `zoom_get_meeting_recordings` (a meeting's
+  recording files — metadata only). All reads; scheduling and editing meetings
+  are a later phase. Recording download and replay links are deliberately not
+  surfaced — listing only — so they never reach a projection, log, or error. A
+  missing source field projects empty, never fabricated. Credentials never
+  leave the daemon; a 401 refreshes once, while an insufficient-scope refusal
+  (Zoom code 4711) names the missing scope and never triggers a pointless
+  refresh.
 
 ## [2.1.0] - 2026-10-13
 

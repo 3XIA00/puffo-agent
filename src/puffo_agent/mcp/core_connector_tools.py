@@ -14,6 +14,7 @@ def register_connector_tools(mcp: FastMCP, cfg: Any) -> None:
     _register_discord(mcp, rpc)
     _register_notion(mcp, rpc)
     _register_calendar(mcp, rpc)
+    _register_zoom(mcp, rpc)
 
 
 def _register_slack(mcp: FastMCP, rpc: Any) -> None:
@@ -246,4 +247,54 @@ def _register_calendar(mcp: FastMCP, rpc: Any) -> None:
         return await rpc.connector(
             "googlecalendar", "delete_event", event_id=event_id, calendar_id=calendar_id,
             from_account=from_account,
+        )
+
+
+def _register_zoom(mcp: FastMCP, rpc: Any) -> None:
+    @mcp.tool()
+    async def zoom_whoami(from_account: str = "") -> dict[str, Any]:
+        """The connected Zoom user: display name, email, account type, personal
+        meeting id (PMI), and timezone.
+
+        ``from_account`` only when several Zoom accounts are shared.
+        """
+        return await rpc.connector("zoom", "whoami", from_account=from_account)
+
+    @mcp.tool()
+    async def zoom_get_meeting(meeting_id: str, from_account: str = "") -> dict[str, Any]:
+        """A meeting's summary: topic, start time, duration (minutes), and join URL.
+
+        ``meeting_id`` is a Zoom meeting id (numeric). Reads only — scheduling and
+        editing meetings are a later phase.
+        """
+        return await rpc.connector(
+            "zoom", "get_meeting", meeting_id=meeting_id, from_account=from_account,
+        )
+
+    @mcp.tool()
+    async def zoom_list_recordings(
+        from_date: str, to_date: str, page_token: str = "", from_account: str = "",
+    ) -> dict[str, Any]:
+        """Cloud recordings for the connected user in a date window, one page at a time.
+
+        ``from_date``/``to_date`` are ``YYYY-MM-DD``. ``page_token`` is a previous
+        call's ``next_page_token`` — pass it to fetch the next page. Lists meeting
+        summaries only; download/replay links are not exposed.
+        """
+        return await rpc.connector(
+            "zoom", "list_recordings", from_date=from_date, to_date=to_date,
+            page_token=page_token, from_account=from_account,
+        )
+
+    @mcp.tool()
+    async def zoom_get_meeting_recordings(
+        meeting_id: str, from_account: str = "",
+    ) -> dict[str, Any]:
+        """The recording files of one meeting — metadata only (type, extension,
+        size, start/end). Download and replay links are not exposed.
+
+        ``meeting_id`` is from ``zoom_list_recordings``.
+        """
+        return await rpc.connector(
+            "zoom", "get_meeting_recordings", meeting_id=meeting_id, from_account=from_account,
         )

@@ -759,6 +759,13 @@ _CONNECTOR_OPS = {
                                         "description": str, "calendar_id": str, "from_account": str}),
         "delete_event": ({"event_id"}, {"calendar_id": str, "from_account": str}),
     },
+    "zoom": {
+        "whoami": (set(), {"from_account": str}),
+        "get_meeting": ({"meeting_id"}, {"from_account": str}),
+        "list_recordings": ({"from_date", "to_date"},
+                            {"page_token": str, "from_account": str}),
+        "get_meeting_recordings": ({"meeting_id"}, {"from_account": str}),
+    },
 }
 
 
@@ -1081,6 +1088,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/googlecalendar",
         connector_route("googlecalendar"),
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/zoom",
+        connector_route("zoom"),
     )
     app.router.add_post(
         "/v1/rpc/{agent_id}/mark-covered",

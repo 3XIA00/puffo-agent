@@ -16,6 +16,7 @@ EXPECTED = {
     "notion_search", "notion_read_page", "notion_create_page", "notion_update_page",
     "calendar_list_events", "calendar_list_calendars", "calendar_create_event",
     "calendar_update_event", "calendar_delete_event",
+    "zoom_whoami", "zoom_get_meeting", "zoom_list_recordings", "zoom_get_meeting_recordings",
 }
 
 

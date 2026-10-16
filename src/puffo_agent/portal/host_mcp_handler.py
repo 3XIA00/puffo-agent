@@ -868,7 +868,7 @@ async def slack_send(
 async def connector(
     ctx: HostMcpContext, *, provider: str, op: str, **kw,
 ) -> dict[str, object]:
-    from . import discord, googlecalendar, notion, slack
+    from . import discord, googlecalendar, notion, slack, zoom
 
     handler = {
         "slack": {"search": slack.search, "read": slack.read, "list_channels": slack.list_channels},
@@ -882,6 +882,12 @@ async def connector(
             "create_event": googlecalendar.create_event,
             "update_event": googlecalendar.update_event,
             "delete_event": googlecalendar.delete_event,
+        },
+        "zoom": {
+            "whoami": zoom.whoami,
+            "get_meeting": zoom.get_meeting,
+            "list_recordings": zoom.list_recordings,
+            "get_meeting_recordings": zoom.get_meeting_recordings,
         },
     }[provider][op]
     return await handler(ctx.credentials, **kw)
